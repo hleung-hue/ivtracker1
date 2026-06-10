@@ -1,5 +1,301 @@
-<!DOCTYPE html>
 <html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              window.parent.postMessage({
+                type: 'screenshotData',
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Interview Calendar</title>
@@ -175,8 +471,6 @@
 
         .legend-swatch {
             width: 18px; height: 18px; border-radius: 3px;
-            background: linear-gradient(45deg, var(--s) 25%, transparent 25%, transparent 50%, var(--s) 50%, var(--s) 75%, transparent 75%);
-            background-size: 8px 8px;
         }
 
         .status-filter { display: flex; gap: 14px; margin-bottom: 1rem; flex-wrap: wrap; }
@@ -292,20 +586,9 @@
         .network-dot.Atheneum   { background: #f59e0b; }
         .network-dot.unknown    { background: #aaa; }
 
-        .interview-card.angle-1 {
-            background: #E6F1FB;
-            border-left-color: #378ADD;
-        }
-
-        .interview-card.angle-2 {
-            background: #FAEEDA;
-            border-left-color: #BA7517;
-        }
-
-        .interview-card.angle-3 {
-            background: #FCEBEB;
-            border-left-color: #E24B4A;
-        }
+        .interview-card.angle-1 { background: #E6F1FB; border-left-color: #378ADD; }
+        .interview-card.angle-2 { background: #FAEEDA; border-left-color: #BA7517; }
+        .interview-card.angle-3 { background: #FCEBEB; border-left-color: #E24B4A; }
 
         .iv-time { font-weight: 600; color: #333; }
         .iv-name { color: #222; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -335,10 +618,6 @@
         .m-label { font-size: 11px; color: #999; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 2px; }
         .m-value { font-size: 13px; font-weight: 500; color: #222; }
 
-        @media (max-width: 900px) {
-            .angle-inputs { grid-template-columns: 1fr; }
-        }
-
         .summary-block {
             background: #fff;
             border: 0.5px solid #e0e0e0;
@@ -348,143 +627,50 @@
             max-width: 700px;
         }
 
-        .summary-block h3 {
-            font-size: 13px;
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 1rem;
-        }
+        .summary-block h3 { font-size: 13px; font-weight: 600; color: #333; margin-bottom: 1rem; }
 
-        .summary-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12px;
-        }
+        .summary-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 
         .summary-table th {
-            background: #E6F1FB;
-            color: #185FA5;
-            padding: 6px 12px;
-            text-align: center;
-            font-weight: 600;
+            background: #E6F1FB; color: #185FA5;
+            padding: 6px 12px; text-align: center; font-weight: 600;
             border: 0.5px solid #c5d9f0;
         }
 
-        .summary-table th.row-header {
-            background: #f5f5f5;
-            color: #333;
-            text-align: right;
-        }
+        .summary-table th.row-header { background: #f5f5f5; color: #333; text-align: right; }
 
-        .summary-table td {
-            padding: 6px 12px;
-            border: 0.5px solid #e8e8e8;
-            text-align: center;
-            color: #333;
-        }
+        .summary-table td { padding: 6px 12px; border: 0.5px solid #e8e8e8; text-align: center; color: #333; }
 
-        .summary-table td.row-label {
-            background: #E6F1FB;
-            color: #185FA5;
-            text-align: right;
-            font-weight: 500;
-        }
-
+        .summary-table td.row-label { background: #E6F1FB; color: #185FA5; text-align: right; font-weight: 500; }
         .summary-table td.row-label.a2 { background: #FAEEDA; color: #854F0B; }
         .summary-table td.row-label.a3 { background: #FCEBEB; color: #A32D2D; }
 
-        .summary-table tr.total-row td {
-            background: #f9f9f9;
-            font-weight: 700;
-            border-top: 1.5px solid #ccc;
-        }
+        .summary-table tr.total-row td { background: #f9f9f9; font-weight: 700; border-top: 1.5px solid #ccc; }
+        .summary-table tr.total-row td.total-label { background: #e8e8e8; color: #A32D2D; text-align: right; }
 
-        .summary-table tr.total-row td.total-label {
-            background: #e8e8e8;
-            color: #A32D2D;
-            text-align: right;
-        }
+        .summary-side-table { border-collapse: collapse; font-size: 12px; }
+        .summary-side-table th { background: #f5f5f5; padding: 6px 12px; border: 0.5px solid #e0e0e0; font-weight: 600; color: #333; text-align: center; }
+        .summary-side-table td { padding: 6px 12px; border: 0.5px solid #e8e8e8; text-align: center; }
 
-        .summary-side {
-            display: inline-block;
-            vertical-align: top;
-            margin-left: 1.5rem;
-        }
+        .target-cell { background: #f5c6c6; color: #A32D2D; font-weight: 600; }
 
-        .summary-side-table {
-            border-collapse: collapse;
-            font-size: 12px;
-        }
+        .summary-row-wrap { display: flex; align-items: flex-start; gap: 1.5rem; flex-wrap: wrap; }
 
-        .summary-side-table th {
-            background: #f5f5f5;
-            padding: 6px 12px;
-            border: 0.5px solid #e0e0e0;
-            font-weight: 600;
-            color: #333;
-            text-align: center;
-        }
-
-        .summary-side-table td {
-            padding: 6px 12px;
-            border: 0.5px solid #e8e8e8;
-            text-align: center;
-        }
-
-        .target-cell {
-            background: #f5c6c6;
-            color: #A32D2D;
-            font-weight: 600;
-        }
-
-        .summary-row-wrap {
-            display: flex;
-            align-items: flex-start;
-            gap: 1.5rem;
-            flex-wrap: wrap;
-        }
-
-        .tabs {
-            display: flex;
-            gap: 0;
-            border-bottom: 1.5px solid #e0e0e0;
-            margin-bottom: 1.5rem;
-        }
+        .tabs { display: flex; gap: 0; border-bottom: 1.5px solid #e0e0e0; margin-bottom: 1.5rem; }
 
         .tab-btn {
-            padding: 10px 20px;
-            border: none;
-            background: none;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            color: #999;
-            border-bottom: 2px solid transparent;
-            margin-bottom: -1.5px;
-            transition: all 0.15s;
+            padding: 10px 20px; border: none; background: none; cursor: pointer;
+            font-size: 14px; font-weight: 500; color: #999;
+            border-bottom: 2px solid transparent; margin-bottom: -1.5px; transition: all 0.15s;
         }
-
         .tab-btn:hover { color: #333; }
-
-        .tab-btn.active {
-            color: #185FA5;
-            border-bottom-color: #185FA5;
-        }
+        .tab-btn.active { color: #185FA5; border-bottom-color: #185FA5; }
 
         .tab-panel { display: none; }
         .tab-panel.active { display: block; }
 
         .angle-def { margin-bottom: 2rem; }
-
-        .angle-def h3 {
-            font-size: 15px;
-            font-weight: 600;
-            padding: 8px 14px;
-            border-radius: 6px;
-            margin-bottom: 1rem;
-            display: inline-block;
-        }
-
+        .angle-def h3 { font-size: 15px; font-weight: 600; padding: 8px 14px; border-radius: 6px; margin-bottom: 1rem; display: inline-block; }
         .angle-def.a1 h3 { background: #E6F1FB; color: #185FA5; }
         .angle-def.a2 h3 { background: #FAEEDA; color: #854F0B; }
         .angle-def.a3 h3 { background: #FCEBEB; color: #A32D2D; }
@@ -495,7 +681,7 @@
         .def-l3::before { content: '–  '; color: #bbb; }
     </style>
 </head>
-<body>
+<body id="artifacts-component-root-html">
 <div class="container">
 
     <div class="tabs">
@@ -506,41 +692,41 @@
     </div>
 
     <div id="tab-calendar" class="tab-panel">
-    <div class="calendar-section" id="calendarSection" style="display: block;">
-        <div class="calendar-header">
-            <h2>Schedule</h2>
-            <div class="nav-controls">
-                <button onclick="prevWeek()">← Prev</button>
-                <span class="current-week" id="weekRange">8 Jun – 14 Jun 2026</span>
-                <button onclick="nextWeek()">Next →</button>
+        <div class="calendar-section" id="calendarSection" style="display: block;">
+            <div class="calendar-header">
+                <h2>Schedule</h2>
+                <div class="nav-controls">
+                    <button onclick="prevWeek()">← Prev</button>
+                    <span class="current-week" id="weekRange">8 Jun – 14 Jun 2026</span>
+                    <button onclick="nextWeek()">Next →</button>
+                </div>
             </div>
-        </div>
 
-        <div class="legend">
-            <div class="legend-item"><div class="legend-swatch" style="background:#E6F1FB; border: 1.5px solid #378ADD;"></div> Angle 1</div>
-            <div class="legend-item"><div class="legend-swatch" style="background:#FAEEDA; border: 1.5px solid #BA7517;"></div> Angle 2</div>
-            <div class="legend-item"><div class="legend-swatch" style="background:#FCEBEB; border: 1.5px solid #E24B4A;"></div> Angle 3</div>
-            <div style="width:1px; background:#e0e0e0; margin: 0 8px;"></div>
-            <div class="legend-item"><span class="network-dot Guidepoint"></span> Guidepoint</div>
-            <div class="legend-item"><span class="network-dot Synquery"></span> Synquery</div>
-            <div class="legend-item"><span class="network-dot Atheneum"></span> Atheneum</div>
-        </div>
-
-        <div class="status-filter">
-            <label><input type="checkbox" value="Scheduled" checked="" onchange="renderCalendar()"> Scheduled</label>
-            <label><input type="checkbox" value="Completed" checked="" onchange="renderCalendar()"> Completed</label>
-            <label><input type="checkbox" value="In Process" checked="" onchange="renderCalendar()"> In Process</label>
-            <label><input type="checkbox" value="Requested" checked="" onchange="renderCalendar()"> Requested</label>
-        </div>
-
-        <div class="calendar-with-times">
-            <div class="time-col">
-                <div class="time-col-header"></div>
-                <div class="time-labels" id="timeLabels"><div class="time-label">08:00</div><div class="time-label">09:00</div><div class="time-label">10:00</div><div class="time-label">11:00</div><div class="time-label">12:00</div><div class="time-label">13:00</div><div class="time-label">14:00</div><div class="time-label">15:00</div><div class="time-label">16:00</div><div class="time-label">17:00</div><div class="time-label">18:00</div><div class="time-label">19:00</div><div class="time-label">20:00</div></div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-swatch" style="background:#E6F1FB; border: 1.5px solid #378ADD;"></div> Angle 1</div>
+                <div class="legend-item"><div class="legend-swatch" style="background:#FAEEDA; border: 1.5px solid #BA7517;"></div> Angle 2</div>
+                <div class="legend-item"><div class="legend-swatch" style="background:#FCEBEB; border: 1.5px solid #E24B4A;"></div> Angle 3</div>
+                <div style="width:1px; background:#e0e0e0; margin: 0 8px;"></div>
+                <div class="legend-item"><span class="network-dot Guidepoint"></span> Guidepoint</div>
+                <div class="legend-item"><span class="network-dot Synquery"></span> Synquery</div>
+                <div class="legend-item"><span class="network-dot Atheneum"></span> Atheneum</div>
             </div>
-            <div style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
-                <div class="days-header-row" id="daysHeader"><div class="day-header-cell"><span class="day-header-num">8</span><span class="day-header-name">Mon</span></div><div class="day-header-cell"><span class="day-header-num">9</span><span class="day-header-name">Tue</span></div><div class="day-header-cell today-col"><span class="day-header-num">10</span><span class="day-header-name">Wed</span></div><div class="day-header-cell"><span class="day-header-num">11</span><span class="day-header-name">Thu</span></div><div class="day-header-cell"><span class="day-header-num">12</span><span class="day-header-name">Fri</span></div><div class="day-header-cell"><span class="day-header-num">13</span><span class="day-header-name">Sat</span></div><div class="day-header-cell"><span class="day-header-num">14</span><span class="day-header-name">Sun</span></div></div>
-                <div class="days-body" id="daysGrid" style="overflow-y:auto; max-height:700px; display:flex; flex:1;"><div class="day-col" style="height: 728px; flex: 1 1 0%; position: relative;"><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div></div><div class="day-col" style="height: 728px; flex: 1 1 0%; position: relative;"><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div style="position: absolute; top: 392px; left: 2px; right: 2px; height: 56px; display: flex; gap: 2px; z-index: 2; align-items: stretch;"><div class="interview-card angle-1" style="flex: 1 0 0%; min-width: 0px; position: relative; top: 0px; height: 56px; overflow: hidden;">
+
+            <div class="status-filter">
+                <label><input type="checkbox" value="Scheduled" checked="" onchange="renderCalendar()"> Scheduled</label>
+                <label><input type="checkbox" value="Completed" checked="" onchange="renderCalendar()"> Completed</label>
+                <label><input type="checkbox" value="In Process" checked="" onchange="renderCalendar()"> In Process</label>
+                <label><input type="checkbox" value="Requested" checked="" onchange="renderCalendar()"> Requested</label>
+            </div>
+
+            <div class="calendar-with-times">
+                <div class="time-col">
+                    <div class="time-col-header"></div>
+                    <div class="time-labels" id="timeLabels"><div class="time-label">08:00</div><div class="time-label">09:00</div><div class="time-label">10:00</div><div class="time-label">11:00</div><div class="time-label">12:00</div><div class="time-label">13:00</div><div class="time-label">14:00</div><div class="time-label">15:00</div><div class="time-label">16:00</div><div class="time-label">17:00</div><div class="time-label">18:00</div><div class="time-label">19:00</div><div class="time-label">20:00</div></div>
+                </div>
+                <div style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+                    <div class="days-header-row" id="daysHeader"><div class="day-header-cell"><span class="day-header-num">8</span><span class="day-header-name">Mon</span></div><div class="day-header-cell"><span class="day-header-num">9</span><span class="day-header-name">Tue</span></div><div class="day-header-cell today-col"><span class="day-header-num">10</span><span class="day-header-name">Wed</span></div><div class="day-header-cell"><span class="day-header-num">11</span><span class="day-header-name">Thu</span></div><div class="day-header-cell"><span class="day-header-num">12</span><span class="day-header-name">Fri</span></div><div class="day-header-cell"><span class="day-header-num">13</span><span class="day-header-name">Sat</span></div><div class="day-header-cell"><span class="day-header-num">14</span><span class="day-header-name">Sun</span></div></div>
+                    <div id="daysGrid" style="overflow-y:auto; max-height:700px; display:flex; flex:1;"><div class="day-col" style="height: 728px; flex: 1 1 0%; position: relative;"><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div></div><div class="day-col" style="height: 728px; flex: 1 1 0%; position: relative;"><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div style="position: absolute; top: 392px; left: 2px; right: 2px; height: 56px; display: flex; gap: 2px; z-index: 2; align-items: stretch;"><div class="interview-card angle-1" style="flex: 1 0 0%; min-width: 0px; position: relative; top: 0px; height: 56px; overflow: hidden;">
                     <div class="iv-tooltip">
                         <div class="tt-name">Pankaj Soni</div>
                         <div class="tt-row">🏢 <span>Cibus</span></div>
@@ -652,7 +838,21 @@
                         <span class="network-dot Synquery"></span>
                         <div class="iv-time">17:00</div>
                     </div>
-                    <div class="iv-name">Marcin Ura, PhD</div></div></div><div style="position: absolute; top: 728px; left: 2px; right: 2px; height: 56px; display: flex; gap: 2px; z-index: 2; align-items: stretch;"><div class="interview-card angle-2" style="flex: 1 0 0%; min-width: 0px; position: relative; top: 0px; height: 56px; overflow: hidden;">
+                    <div class="iv-name">Marcin Ura, PhD</div></div><div class="interview-card angle-2" style="flex: 1 0 0%; min-width: 0px; position: relative; top: 0px; height: 56px; overflow: hidden;">
+                    <div class="iv-tooltip">
+                        <div class="tt-name">Dr. Stacey Gabriel PhD</div>
+                        <div class="tt-row">🏢 <span>Broad Institute</span></div>
+                        <div class="tt-row">📍 <span>USA</span></div>
+                        <div class="tt-row">🕐 <span>17:00 – 18:00</span></div>
+                        <div class="tt-row">💰 <span>$627.00 / hr</span></div>
+                        <div class="tt-row"><span class="network-dot Guidepoint"></span> <span>Guidepoint</span></div>
+                        <div class="tt-row" style="margin-top:4px; color:#888; font-size:11px;">Click for full details</div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:3px;">
+                        <span class="network-dot Guidepoint"></span>
+                        <div class="iv-time">17:00</div>
+                    </div>
+                    <div class="iv-name">Dr. Stacey Gabriel PhD</div></div></div><div style="position: absolute; top: 728px; left: 2px; right: 2px; height: 56px; display: flex; gap: 2px; z-index: 2; align-items: stretch;"><div class="interview-card angle-2" style="flex: 1 0 0%; min-width: 0px; position: relative; top: 0px; height: 56px; overflow: hidden;">
                     <div class="iv-tooltip">
                         <div class="tt-name">Dr. Jen-Tsan Chi MD. PhD.</div>
                         <div class="tt-row">🏢 <span>Duke University Health System, Inc.</span></div>
@@ -694,21 +894,7 @@
                         <span class="network-dot Guidepoint"></span>
                         <div class="iv-time">16:00</div>
                     </div>
-                    <div class="iv-name">Dr. Ravi Dyavar</div></div></div><div style="position: absolute; top: 336px; left: 2px; right: 2px; height: 56px; display: flex; gap: 2px; z-index: 2; align-items: stretch;"><div class="interview-card angle-2" style="flex: 1 0 0%; min-width: 0px; position: relative; top: 0px; height: 56px; overflow: hidden;">
-                    <div class="iv-tooltip">
-                        <div class="tt-name">Dr. Stacey Gabriel PhD</div>
-                        <div class="tt-row">🏢 <span>Broad Institute</span></div>
-                        <div class="tt-row">📍 <span>USA</span></div>
-                        <div class="tt-row">🕐 <span>14:00 – 15:00</span></div>
-                        <div class="tt-row">💰 <span>$627.00 / hr</span></div>
-                        <div class="tt-row"><span class="network-dot Guidepoint"></span> <span>Guidepoint</span></div>
-                        <div class="tt-row" style="margin-top:4px; color:#888; font-size:11px;">Click for full details</div>
-                    </div>
-                    <div style="display:flex; align-items:center; gap:3px;">
-                        <span class="network-dot Guidepoint"></span>
-                        <div class="iv-time">14:00</div>
-                    </div>
-                    <div class="iv-name">Dr. Stacey Gabriel PhD</div></div></div><div style="position: absolute; top: 392px; left: 2px; right: 2px; height: 56px; display: flex; gap: 2px; z-index: 2; align-items: stretch;"><div class="interview-card angle-2" style="flex: 1 0 0%; min-width: 0px; position: relative; top: 0px; height: 56px; overflow: hidden;">
+                    <div class="iv-name">Dr. Ravi Dyavar</div></div></div><div style="position: absolute; top: 392px; left: 2px; right: 2px; height: 56px; display: flex; gap: 2px; z-index: 2; align-items: stretch;"><div class="interview-card angle-2" style="flex: 1 0 0%; min-width: 0px; position: relative; top: 0px; height: 56px; overflow: hidden;">
                     <div class="iv-tooltip">
                         <div class="tt-name">Dr. Sraboni Chaudhury</div>
                         <div class="tt-row">🏢 <span>Research Scientist</span></div>
@@ -765,195 +951,114 @@
                         <div class="iv-time">13:00</div>
                     </div>
                     <div class="iv-name">Hsiao-yun (Christy) Milliron</div></div></div></div><div class="day-col" style="height: 728px; flex: 1 1 0%; position: relative;"><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div></div><div class="day-col" style="height: 728px; flex: 1 1 0%; position: relative;"><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div><div class="hour-cell"></div></div></div>
+                </div>
             </div>
         </div>
     </div>
-</div>
-</div><!-- /tab-calendar -->
 
-<div id="tab-input" class="tab-panel active">
-    <div class="input-section">
-        <h2>Input data</h2>
-        <p>Select rows in Excel → Copy → click the zone below → Paste (Ctrl+V / Cmd+V). Repeat for each angle.</p>
+    <div id="tab-input" class="tab-panel active">
+        <div class="input-section">
+            <h2>Input data</h2>
+            <p>Select rows in Excel → Copy → click the zone below → Paste (Ctrl+V / Cmd+V). Repeat for each angle.</p>
 
-        <div class="angle-inputs">
-            <div class="angle-block">
-                <label style="color:#185FA5">Angle 1</label>
-                <div class="paste-zone angle-1 has-data" id="zone1" tabindex="0"><div class="preview-table-wrap"><table class="preview-table"><thead><tr><th>#</th><th>Status</th><th>Profile</th><th>Name</th><th>Company</th><th>Role</th><th>Location</th><th>Cost</th><th></th><th>Cur</th><th>Network</th><th>Date</th><th>Start</th><th>End</th><th>Dur</th><th>Net cost</th></tr></thead><tbody><tr><td>A1</td><td>Completed</td><td>1aiv</td><td>Dr. Tanima Bose</td><td>Novartis AG</td><td></td><td>DEU</td><td>$612.48 / hr</td><td>612.48</td><td>USD</td><td>Guidepoint</td><td>01/06/26</td><td>15:00</td><td>16:15</td><td>1.25</td><td>765.6</td><td>Novartis (03/2022–present; GMP Quality lead since 03/2025); antibodies/biologics, CTx, GTx, mRNA. Uses long-read NGS externally. Covers target discovery through drug design, characterization, CMC/QC, clinical development. Cluster a/b.</td></tr><tr><td>A2</td><td>Completed</td><td>1aii</td><td>Dr. Bat-Erdene Jugder</td><td>AstraZeneca PLC</td><td></td><td>USA</td><td>$396.00 / hr</td><td>396</td><td>USD</td><td>Guidepoint</td><td>02/06/26</td><td>17:30</td><td>18:40</td><td>1.17</td><td>462.0</td><td>AstraZeneca (06/2023–present), Target Discovery Team Lead in immunology; antibodies/biologics and CTx. Uses long-read NGS. Strongest in target discovery and lead/cell-line characterization, with broader discovery/CMC visibility. Cluster a.</td></tr><tr><td>A3</td><td>Completed</td><td>1aiii</td><td>Mrs. Jigesha Dholakia</td><td>Bayer Aktiengesellschaft</td><td></td><td>USA</td><td>$495.00 / hr</td><td>495</td><td>USD</td><td>Guidepoint</td><td>02/06/26</td><td>19:00</td><td>20:00</td><td>1.00</td><td>495.0</td><td>Bayer (07/2023–present), CMC Analytical Strategy Director; specializes in CTx and GTx. Uses long-read NGS. Focused on construct/vector build, product characterization, CMC, QC-adjacent workflows, and clinical development. Cluster c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Giacomo Tampella</td><td>BrainChild Bio, Inc.</td><td></td><td>USA</td><td>$132.00 / hr</td><td>132</td><td>USD</td><td>Guidepoint</td><td></td><td></td><td></td><td>1.00</td><td>132.0</td><td>BrainChild Bio-listed Principal Scientist; prior Pfizer Principal Scientist (05/2023–05/2025). Specializes in antibodies/biologics, CTx, and GTx. Uses long-read NGS. Focused on target discovery, construct/vector build, and hPSC clone characterization. Cluster b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Xiangming Li</td><td>Cartesian Therapeutics, Inc.</td><td></td><td>USA</td><td>$578.16 / hr</td><td>578.16</td><td>USD</td><td>Guidepoint</td><td>16/06/26</td><td>15:00</td><td>16:00</td><td>1.00</td><td>578.2</td><td>Cartesian Therapeutics (01/2024–present), Bioprocess Development Director on mRNA CAR-T; biologics/antibody platform background. Uses long-read NGS. Focused on construct/vector build, cell-line characterization, CMC, QC, and early clinical workflows. Cluster c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Mr. Adrian Lau</td><td>Eli Lilly and Company</td><td></td><td>USA</td><td>$369.60 / hr</td><td>369.6</td><td>USD</td><td>Guidepoint</td><td>12/06/26</td><td>19:00</td><td>20:00</td><td>1.00</td><td>369.6</td><td>Eli Lilly (10/2022–present), Principal Scientist in preclinical gene therapy/AAV. Specializes in GTx and mRNA/nucleic acids. Uses long-read NGS externally. Focused on target discovery, expression profiling, QC, and biology understanding. Cluster a.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Wei Guo</td><td>Amgen (Jul 2023 - Now)</td><td>N/A</td><td>United States</td><td>$900 / hr</td><td>900</td><td>USD</td><td>Atheneum</td><td></td><td></td><td></td><td>1.00</td><td>900.0</td><td>Amgen (07/2023–present as Senior Scientist; 09/2020–present overall), biologics/antibodies, mRNA/nucleic acids, small molecules. No long-read use stated. Focused on target discovery, drug design, CRISPR knockout, and cell-line validation. Cluster a.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Purushotham Reddy Koppula</td><td>Regeneron Pharmaceuticals, Inc.</td><td></td><td>USA</td><td>$858.00 / hr</td><td>858</td><td>USD</td><td>Guidepoint</td><td>10/06/26</td><td>20:00</td><td>21:00</td><td>1.00</td><td>858.0</td><td>Regeneron (01/2020–present), Research Program Manager; antibodies/biologics, CTx, GTx, mRNA. Uses long-read sequencing. Broad visibility across target discovery, drug design, characterization, CMC/QC, clinical development, and rare disease/cell therapy. Cluster a/b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Ofer Yizhar Barnea</td><td>Scribe Therapeutics Inc.</td><td>" - Manager of Functional Genomics:64x Bio    (07/2023 to 12/2023)  - Founder:Geneyx Genomex Ltd    (06/2021 to 07/2023)"</td><td>USA</td><td>$330.00 / hr</td><td>330</td><td>USD</td><td>Guidepoint</td><td>10/06/26</td><td>18:30</td><td>19:30</td><td>1.00</td><td>330.0</td><td>Scribe Therapeutics (03/2024–present), Senior Scientist developing CRISPR/off-target strategies; CTx and GTx. Uses long-read NGS. Focused on target discovery, construct/vector build, lead/cell-line characterization, and translational science. Cluster b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Ravi Dyavar</td><td>Adicet Bio, Inc.</td><td></td><td>USA</td><td>$198.00 / hr</td><td>198</td><td>USD</td><td>Guidepoint</td><td>11/06/26</td><td>16:00</td><td>17:00</td><td>1.00</td><td>198.0</td><td>Adicet Bio (01/2021–present; Principal Scientist since 07/2024), CTx specialist. Uses long-read NGS. Covers target discovery, drug design, construct/vector build, product characterization, CMC/QC, clinical development, and potency gene-expression analysis. Cluster c.</td></tr><tr><td>A5</td><td>Completed</td><td></td><td>Pankaj Soni</td><td>Cibus</td><td></td><td>San Diego, CA</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>09/06/26</td><td>15:00</td><td>16:00</td><td>1.00</td><td>900.0</td><td>Cibus (2025–present), Senior Director Molecular Discovery; prior Pfizer (2014–2022). Specializes in antibodies/biologics and mRNA/nucleic acids. Long-read not specified. Covers target discovery through CMC/QC, clinical development, construct verification, and cell-line characterization. Cluster a/b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Daniel Cirera-Salinas</td><td>Novartis</td><td></td><td>Basel, Switzerland</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>10/06/26</td><td>14:00</td><td>15:00</td><td>1.00</td><td>900.0</td><td>Novartis (2018–present), Head of Biologics Analytical R&amp;D; antibodies/biologics, CTx, GTx, mRNA. Long-read not specified. Covers target discovery through BLA, sequence confirmation, cell-line/clonality assessment, biomarkers, and patient stratification. Cluster a/b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Paul Robbins</td><td>Allogene Therapeutics</td><td></td><td>San Francisco, CA</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>12/06/26</td><td>16:30</td><td>17:30</td><td>1.00</td><td>900.0</td><td>Allogene Therapeutics (2023–present), VP Translational Sciences; CTx-focused with biologics/antibody and GTx overlap. Long-read not specified. Covers target discovery, construct/vector build, characterization, CMC/QC, clinical, donor/product characterization, and response analysis. Cluster b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Marcin Ura, PhD</td><td>Monod Bio</td><td></td><td>Cambridge, MA</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>10/06/26</td><td>17:00</td><td>18:00</td><td>1.00</td><td>900.0</td><td>Monod Bio (current), Principal Scientist in antibody engineering/lead optimization; antibodies/biologics specialist. Long-read not specified. Focused on drug design, lead characterization, CMC-adjacent workflows, construct verification, and library QC. Cluster a.</td></tr><tr><td>A4</td><td>Completed</td><td></td><td>Laurent Poirot</td><td>Cellectis</td><td></td><td>Paris, France</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>09/06/26</td><td>12:00</td><td>13:00</td><td>1.00</td><td>900.0</td><td>Cellectis (2020–present; SVP Immunology/Translational Research Lead since 2025), allogeneic CAR-T CTx, GTx, and antibodies. Long-read not specified. Focused on target discovery, drug design, construct/vector build, NGS and TCR sequencing. Cluster a/b.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Hitesh Arora</td><td>Absci</td><td></td><td>Portland, OR</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>15/06/26</td><td>13:00</td><td>14:00</td><td>1.00</td><td>900.0</td><td>Absci (2025–present), Senior Scientist Immunology; antibodies/biologics including mAbs, bispecifics, VHHs/nanobodies. Long-read not specified. Focused on target identification/validation, functional asset development, efficacy, PKPD, immunogenicity, and NGS splice variants. Cluster a.</td></tr></tbody></table></div><div class="zone-footer"><span>16 rows pasted</span><button>Clear</button></div></div>
+            <div class="angle-inputs">
+                <div class="angle-block">
+                    <label style="color:#185FA5">Angle 1</label>
+                    <div class="paste-zone angle-1 has-data" id="zone1" tabindex="0" contenteditable="true"><div class="preview-table-wrap"><table class="preview-table"><thead><tr><th>#</th><th>Status</th><th>Profile</th><th>Name</th><th>Company</th><th>Role</th><th>Location</th><th>Cost</th><th></th><th>Cur</th><th>Network</th><th>Date</th><th>Start</th><th>End</th><th>Dur</th><th>Net cost</th></tr></thead><tbody><tr><td>A1</td><td>Completed</td><td>1aiv</td><td>Dr. Tanima Bose</td><td>Novartis AG</td><td></td><td>DEU</td><td>$612.48 / hr</td><td>612.48</td><td>USD</td><td>Guidepoint</td><td>01/06/26</td><td>15:00</td><td>16:15</td><td>1.25</td><td>765.6</td><td>Novartis (03/2022–present; GMP Quality lead since 03/2025); antibodies/biologics, CTx, GTx, mRNA. Uses long-read NGS externally. Covers target discovery through drug design, characterization, CMC/QC, clinical development. Cluster a/b.</td></tr><tr><td>A2</td><td>Completed</td><td>1aii</td><td>Dr. Bat-Erdene Jugder</td><td>AstraZeneca PLC</td><td></td><td>USA</td><td>$396.00 / hr</td><td>396</td><td>USD</td><td>Guidepoint</td><td>02/06/26</td><td>17:30</td><td>18:40</td><td>1.17</td><td>462.0</td><td>AstraZeneca (06/2023–present), Target Discovery Team Lead in immunology; antibodies/biologics and CTx. Uses long-read NGS. Strongest in target discovery and lead/cell-line characterization, with broader discovery/CMC visibility. Cluster a.</td></tr><tr><td>A3</td><td>Completed</td><td>1aiii</td><td>Mrs. Jigesha Dholakia</td><td>Bayer Aktiengesellschaft</td><td></td><td>USA</td><td>$495.00 / hr</td><td>495</td><td>USD</td><td>Guidepoint</td><td>02/06/26</td><td>19:00</td><td>20:00</td><td>1.00</td><td>495.0</td><td>Bayer (07/2023–present), CMC Analytical Strategy Director; specializes in CTx and GTx. Uses long-read NGS. Focused on construct/vector build, product characterization, CMC, QC-adjacent workflows, and clinical development. Cluster c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Giacomo Tampella</td><td>BrainChild Bio, Inc.</td><td></td><td>USA</td><td>$132.00 / hr</td><td>132</td><td>USD</td><td>Guidepoint</td><td></td><td></td><td></td><td>1.00</td><td>132.0</td><td>BrainChild Bio-listed Principal Scientist; prior Pfizer Principal Scientist (05/2023–05/2025). Specializes in antibodies/biologics, CTx, and GTx. Uses long-read NGS. Focused on target discovery, construct/vector build, and hPSC clone characterization. Cluster b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Xiangming Li</td><td>Cartesian Therapeutics, Inc.</td><td></td><td>USA</td><td>$578.16 / hr</td><td>578.16</td><td>USD</td><td>Guidepoint</td><td>16/06/26</td><td>15:00</td><td>16:00</td><td>1.00</td><td>578.2</td><td>Cartesian Therapeutics (01/2024–present), Bioprocess Development Director on mRNA CAR-T; biologics/antibody platform background. Uses long-read NGS. Focused on construct/vector build, cell-line characterization, CMC, QC, and early clinical workflows. Cluster c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Mr. Adrian Lau</td><td>Eli Lilly and Company</td><td></td><td>USA</td><td>$369.60 / hr</td><td>369.6</td><td>USD</td><td>Guidepoint</td><td>12/06/26</td><td>19:00</td><td>20:00</td><td>1.00</td><td>369.6</td><td>Eli Lilly (10/2022–present), Principal Scientist in preclinical gene therapy/AAV. Specializes in GTx and mRNA/nucleic acids. Uses long-read NGS externally. Focused on target discovery, expression profiling, QC, and biology understanding. Cluster a.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Wei Guo</td><td>Amgen (Jul 2023 - Now)</td><td>N/A</td><td>United States</td><td>$900 / hr</td><td>900</td><td>USD</td><td>Atheneum</td><td></td><td></td><td></td><td>1.00</td><td>900.0</td><td>Amgen (07/2023–present as Senior Scientist; 09/2020–present overall), biologics/antibodies, mRNA/nucleic acids, small molecules. No long-read use stated. Focused on target discovery, drug design, CRISPR knockout, and cell-line validation. Cluster a.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Purushotham Reddy Koppula</td><td>Regeneron Pharmaceuticals, Inc.</td><td></td><td>USA</td><td>$858.00 / hr</td><td>858</td><td>USD</td><td>Guidepoint</td><td>10/06/26</td><td>20:00</td><td>21:00</td><td>1.00</td><td>858.0</td><td>Regeneron (01/2020–present), Research Program Manager; antibodies/biologics, CTx, GTx, mRNA. Uses long-read sequencing. Broad visibility across target discovery, drug design, characterization, CMC/QC, clinical development, and rare disease/cell therapy. Cluster a/b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Ofer Yizhar Barnea</td><td>Scribe Therapeutics Inc.</td><td>" - Manager of Functional Genomics:64x Bio    (07/2023 to 12/2023)  - Founder:Geneyx Genomex Ltd    (06/2021 to 07/2023)"</td><td>USA</td><td>$330.00 / hr</td><td>330</td><td>USD</td><td>Guidepoint</td><td>10/06/26</td><td>18:30</td><td>19:30</td><td>1.00</td><td>330.0</td><td>Scribe Therapeutics (03/2024–present), Senior Scientist developing CRISPR/off-target strategies; CTx and GTx. Uses long-read NGS. Focused on target discovery, construct/vector build, lead/cell-line characterization, and translational science. Cluster b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Ravi Dyavar</td><td>Adicet Bio, Inc.</td><td></td><td>USA</td><td>$198.00 / hr</td><td>198</td><td>USD</td><td>Guidepoint</td><td>11/06/26</td><td>16:00</td><td>17:00</td><td>1.00</td><td>198.0</td><td>Adicet Bio (01/2021–present; Principal Scientist since 07/2024), CTx specialist. Uses long-read NGS. Covers target discovery, drug design, construct/vector build, product characterization, CMC/QC, clinical development, and potency gene-expression analysis. Cluster c.</td></tr><tr><td>A5</td><td>Completed</td><td></td><td>Pankaj Soni</td><td>Cibus</td><td></td><td>San Diego, CA</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>09/06/26</td><td>15:00</td><td>16:00</td><td>1.00</td><td>900.0</td><td>Cibus (2025–present), Senior Director Molecular Discovery; prior Pfizer (2014–2022). Specializes in antibodies/biologics and mRNA/nucleic acids. Long-read not specified. Covers target discovery through CMC/QC, clinical development, construct verification, and cell-line characterization. Cluster a/b/c.</td></tr><tr><td>A6</td><td>Completed</td><td></td><td>Daniel Cirera-Salinas</td><td>Novartis</td><td></td><td>Basel, Switzerland</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>10/06/26</td><td>14:00</td><td>15:00</td><td>1.00</td><td>900.0</td><td>Novartis (2018–present), Head of Biologics Analytical R&amp;D; antibodies/biologics, CTx, GTx, mRNA. Long-read not specified. Covers target discovery through BLA, sequence confirmation, cell-line/clonality assessment, biomarkers, and patient stratification. Cluster a/b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Paul Robbins</td><td>Allogene Therapeutics</td><td></td><td>San Francisco, CA</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>12/06/26</td><td>16:30</td><td>17:30</td><td>1.00</td><td>900.0</td><td>Allogene Therapeutics (2023–present), VP Translational Sciences; CTx-focused with biologics/antibody and GTx overlap. Long-read not specified. Covers target discovery, construct/vector build, characterization, CMC/QC, clinical, donor/product characterization, and response analysis. Cluster b/c.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Marcin Ura, PhD</td><td>Monod Bio</td><td></td><td>Cambridge, MA</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>10/06/26</td><td>17:00</td><td>18:00</td><td>1.00</td><td>900.0</td><td>Monod Bio (current), Principal Scientist in antibody engineering/lead optimization; antibodies/biologics specialist. Long-read not specified. Focused on drug design, lead characterization, CMC-adjacent workflows, construct verification, and library QC. Cluster a.</td></tr><tr><td>A4</td><td>Completed</td><td></td><td>Laurent Poirot</td><td>Cellectis</td><td></td><td>Paris, France</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>09/06/26</td><td>12:00</td><td>13:00</td><td>1.00</td><td>900.0</td><td>Cellectis (2020–present; SVP Immunology/Translational Research Lead since 2025), allogeneic CAR-T CTx, GTx, and antibodies. Long-read not specified. Focused on target discovery, drug design, construct/vector build, NGS and TCR sequencing. Cluster a/b.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Hitesh Arora</td><td>Absci</td><td></td><td>Portland, OR</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Synquery</td><td>15/06/26</td><td>13:00</td><td>14:00</td><td>1.00</td><td>900.0</td><td>Absci (2025–present), Senior Scientist Immunology; antibodies/biologics including mAbs, bispecifics, VHHs/nanobodies. Long-read not specified. Focused on target identification/validation, functional asset development, efficacy, PKPD, immunogenicity, and NGS splice variants. Cluster a.</td></tr></tbody></table></div><div class="zone-footer"><span>16 rows pasted</span><button>Clear</button></div></div>
+                </div>
+                <div class="angle-block">
+                    <label style="color:#854F0B">Angle 2</label>
+                    <div class="paste-zone angle-2 has-data" id="zone2" tabindex="0" contenteditable="true"><div class="preview-table-wrap"><table class="preview-table"><thead><tr><th>#</th><th>Status</th><th>Profile</th><th>Name</th><th>Company</th><th>Role</th><th>Location</th><th>Cost</th><th></th><th>Cur</th><th>Network</th><th>Date</th><th>Start</th><th>End</th><th>Dur</th><th>Net cost</th></tr></thead><tbody><tr><td>B2</td><td>Completed</td><td></td><td>Dr. Maximilian Krause</td><td>TUD Dresden University of Technology</td><td></td><td>DEU</td><td>$382.80 / hr</td><td>382.8</td><td>USD</td><td>Guidepoint</td><td>09/06/26</td><td>10:00</td><td>11:00</td><td>1.00</td><td>382.8</td><td>TUD Dresden / Dresden-concept Genome Center leader since 2021; genomics core director. Supports targeted DNA, targeted methylation, short-read WGS and WGS+methylation; highly confident in long-read. Low annual volume (&lt;100), ~10% methylation.</td></tr><tr><td></td><td>In Process</td><td></td><td>Mr. Brewster Kingham</td><td>University of Delaware</td><td></td><td>USA</td><td>$316.80 / hr</td><td>316.8</td><td>USD</td><td>Guidepoint</td><td></td><td></td><td></td><td>1.00</td><td>316.8</td><td>University of Delaware Sequencing &amp; Genotyping Center Director with 35 years in genomics. Oversees ONT, PacBio, Illumina, Element and 10X platforms; uses targeted DNA, methylation, short/long-read WGS and WGS+methylation. 500–2,000 samples/year, ~65% methylation.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Nicholas Beckloff PhD, PMP</td><td>University of Louisville</td><td></td><td>USA</td><td>$429.00 / hr</td><td>429</td><td>USD</td><td>Guidepoint</td><td></td><td></td><td></td><td>1.00</td><td>429.0</td><td>University of Louisville Sequencing Translational Center Director (01/2025–present); former ONT field application specialist and genomics core director. Uses targeted DNA, methylation, short-read, long-read WGS and WGS+methylation; 500–2,000 samples/year.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Stacey Gabriel PhD</td><td>Broad Institute</td><td></td><td>USA</td><td>$627.00 / hr</td><td>627</td><td>USD</td><td>Guidepoint</td><td>10/06/26</td><td>17:00</td><td>18:00</td><td>1.00</td><td>627.0</td><td>Broad Institute EVP, Head of Platforms (09/2023–present); Broad genomics platform leader since 1998. Uses targeted DNA, methylation, short-read WGS, long-read WGS and WGS+methylation; &gt;10,000 samples/year, ~10% methylation.</td></tr><tr><td>B1</td><td>Completed</td><td></td><td>Dr. Graham Johnson</td><td>Duke Human Vaccine Institute</td><td></td><td>USA</td><td>$528.00 / hr</td><td>528</td><td>USD</td><td>Guidepoint</td><td>04/06/26</td><td>18:00</td><td>19:00</td><td>1.00</td><td>528.0</td><td></td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Sraboni Chaudhury</td><td>Research Scientist</td><td></td><td>USA</td><td>$330.00 / hr</td><td>330</td><td>USD</td><td>Guidepoint</td><td>11/06/26</td><td>15:00</td><td>16:00</td><td>1.00</td><td>330.0</td><td>University of Michigan Research Scientist (12/2010–present), academic genomics platform scientist. Uses targeted DNA, methylation, short-read and long-read WGS; high workflow confidence. Runs 500–2,000 samples/year with ~70% methylation.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Eric Vilain</td><td>University of California Irvine Health</td><td></td><td>USA</td><td>$528.00 / hr</td><td>528</td><td>USD</td><td>Guidepoint</td><td>16/06/26</td><td>19:00</td><td>20:00</td><td>1.00</td><td>528.0</td><td>UC Irvine Associate Vice Chancellor / Pediatrics Professor with genomics and precision medicine leadership. Uses targeted DNA, targeted methylation, short-read WGS, long-read WGS and WGS+methylation; highly confident across workflows. 500–2,000 samples/year, ~50% methylation.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Hsiao-yun (Christy) Milliron</td><td>Van Andel Institute</td><td></td><td>Grand Rapids, MI</td><td>$900/hr</td><td>0</td><td>USD</td><td>Synquery</td><td>12/06/26</td><td>13:00</td><td>14:00</td><td>1.00</td><td>0.0</td><td>Van Andel Institute methylation specialist, 12 years total; Research Scientist in Epigenetics. Uses WGBS, methylation/SNP arrays and single-cell multi-omics; no long-read noted. ~5,000 samples/year, ~100% methylation-focused.</td></tr><tr><td>B3</td><td>Completed</td><td></td><td>Nicolas Robine</td><td>New York Genome Center</td><td></td><td>New York, NY</td><td>$900/hr</td><td>0</td><td>USD</td><td>Synquery</td><td>09/06/26</td><td>13:00</td><td>14:00</td><td>1.00</td><td>0.0</td><td>New York Genome Center Senior Director, Computational Biology; 13 years at NYGC leading 20 scientists. Runs &gt;10,000 samples/year across short-read and long-read platforms (ONT/PacBio); ~5% methylation, actively benchmarking protocols.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Jen-Tsan Chi MD. PhD.</td><td>Duke University Health System, Inc.</td><td></td><td>USA</td><td>$330.00 / hr</td><td>330</td><td>USD</td><td>Guidepoint</td><td>10/06/26</td><td>21:00</td><td>22:00</td><td>1.00</td><td>330.0</td><td>Duke University Professor at the Duke Genome Center/Cancer Institute since 2005. Oncology-focused PI using targeted DNA, targeted methylation, short-read WGS and long-read WGS; very confident in long-read. Runs 2,000–10,000 samples/year, ~30% epigenetic/methylation.</td></tr></tbody></table></div><div class="zone-footer"><span>10 rows pasted</span><button>Clear</button></div></div>
+                </div>
+                <div class="angle-block">
+                    <label style="color:#A32D2D">Angle 3</label>
+                    <div class="paste-zone angle-3 has-data" id="zone3" tabindex="0" contenteditable="true"><div class="preview-table-wrap"><table class="preview-table"><thead><tr><th>#</th><th>Status</th><th>Profile</th><th>Name</th><th>Company</th><th>Role</th><th>Location</th><th>Cost</th><th></th><th>Cur</th><th>Network</th><th>Date</th><th>Start</th><th>End</th><th>Dur</th><th>Net cost</th></tr></thead><tbody><tr><td>C1</td><td>Completed</td><td></td><td>Dr. Greg Elgar</td><td>Genomics England Limited</td><td></td><td>GBR</td><td>$353.76 / hr</td><td>353.76</td><td>USD</td><td>Genomics England Limited</td><td>05/06/26</td><td>13:30</td><td>14:30</td><td>1.00</td><td>353.8</td><td></td></tr><tr><td></td><td>Scheduled</td><td></td><td>Augusto Rendon</td><td>Genomics England</td><td></td><td>London, UK</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Genomics England</td><td>10/06/26</td><td>16:00</td><td>17:00</td><td>1.00</td><td>900.0</td><td>Genomics England Chief Bioinformatician since 2019; former Director of Bioinformatics and Cambridge research associate. Programme-level population genomics expert with &gt;10,000 genomes/year visibility, using outsourced Illumina short-read and internal ONT long-read WGS. Low methylation exposure today (~1% WGS volume).</td></tr></tbody></table></div><div class="zone-footer"><span>2 rows pasted</span><button>Clear</button></div></div>
+                </div>
             </div>
-            <div class="angle-block">
-                <label style="color:#854F0B">Angle 2</label>
-                <div class="paste-zone angle-2 has-data" id="zone2" tabindex="0"><div class="preview-table-wrap"><table class="preview-table"><thead><tr><th>#</th><th>Status</th><th>Profile</th><th>Name</th><th>Company</th><th>Role</th><th>Location</th><th>Cost</th><th></th><th>Cur</th><th>Network</th><th>Date</th><th>Start</th><th>End</th><th>Dur</th><th>Net cost</th></tr></thead><tbody><tr><td>B2</td><td>Completed</td><td></td><td>Dr. Maximilian Krause</td><td>TUD Dresden University of Technology</td><td></td><td>DEU</td><td>$382.80 / hr</td><td>382.8</td><td>USD</td><td>Guidepoint</td><td>09/06/26</td><td>10:00</td><td>11:00</td><td>1.00</td><td>382.8</td><td>TUD Dresden / Dresden-concept Genome Center leader since 2021; genomics core director. Supports targeted DNA, targeted methylation, short-read WGS and WGS+methylation; highly confident in long-read. Low annual volume (&lt;100), ~10% methylation.</td></tr><tr><td></td><td>In Process</td><td></td><td>Mr. Brewster Kingham</td><td>University of Delaware</td><td></td><td>USA</td><td>$316.80 / hr</td><td>316.8</td><td>USD</td><td>Guidepoint</td><td></td><td></td><td></td><td>1.00</td><td>316.8</td><td>University of Delaware Sequencing &amp; Genotyping Center Director with 35 years in genomics. Oversees ONT, PacBio, Illumina, Element and 10X platforms; uses targeted DNA, methylation, short/long-read WGS and WGS+methylation. 500–2,000 samples/year, ~65% methylation.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Nicholas Beckloff PhD, PMP</td><td>University of Louisville</td><td></td><td>USA</td><td>$429.00 / hr</td><td>429</td><td>USD</td><td>Guidepoint</td><td></td><td></td><td></td><td>1.00</td><td>429.0</td><td>University of Louisville Sequencing Translational Center Director (01/2025–present); former ONT field application specialist and genomics core director. Uses targeted DNA, methylation, short-read, long-read WGS and WGS+methylation; 500–2,000 samples/year.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Stacey Gabriel PhD</td><td>Broad Institute</td><td></td><td>USA</td><td>$627.00 / hr</td><td>627</td><td>USD</td><td>Guidepoint</td><td>11/06/26</td><td>14:00</td><td>15:00</td><td>1.00</td><td>627.0</td><td>Broad Institute EVP, Head of Platforms (09/2023–present); Broad genomics platform leader since 1998. Uses targeted DNA, methylation, short-read WGS, long-read WGS and WGS+methylation; &gt;10,000 samples/year, ~10% methylation.</td></tr><tr><td>B1</td><td>Completed</td><td></td><td>Dr. Graham Johnson</td><td>Duke Human Vaccine Institute</td><td></td><td>USA</td><td>$528.00 / hr</td><td>528</td><td>USD</td><td>Guidepoint</td><td>04/06/26</td><td>18:00</td><td>19:00</td><td>1.00</td><td>528.0</td><td></td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Sraboni Chaudhury</td><td>Research Scientist</td><td></td><td>USA</td><td>$330.00 / hr</td><td>330</td><td>USD</td><td>Guidepoint</td><td>11/06/26</td><td>15:00</td><td>16:00</td><td>1.00</td><td>330.0</td><td>University of Michigan Research Scientist (12/2010–present), academic genomics platform scientist. Uses targeted DNA, methylation, short-read and long-read WGS; high workflow confidence. Runs 500–2,000 samples/year with ~70% methylation.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Eric Vilain</td><td>University of California Irvine Health</td><td></td><td>USA</td><td>$528.00 / hr</td><td>528</td><td>USD</td><td>Guidepoint</td><td>16/06/26</td><td>19:00</td><td>20:00</td><td>1.00</td><td>528.0</td><td>UC Irvine Associate Vice Chancellor / Pediatrics Professor with genomics and precision medicine leadership. Uses targeted DNA, targeted methylation, short-read WGS, long-read WGS and WGS+methylation; highly confident across workflows. 500–2,000 samples/year, ~50% methylation.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Hsiao-yun (Christy) Milliron</td><td>Van Andel Institute</td><td></td><td>Grand Rapids, MI</td><td>$900/hr</td><td>0</td><td>USD</td><td>Synquery</td><td>12/06/26</td><td>13:00</td><td>14:00</td><td>1.00</td><td>0.0</td><td>Van Andel Institute methylation specialist, 12 years total; Research Scientist in Epigenetics. Uses WGBS, methylation/SNP arrays and single-cell multi-omics; no long-read noted. ~5,000 samples/year, ~100% methylation-focused.</td></tr><tr><td>B3</td><td>Completed</td><td></td><td>Nicolas Robine</td><td>New York Genome Center</td><td></td><td>New York, NY</td><td>$900/hr</td><td>0</td><td>USD</td><td>Synquery</td><td>09/06/26</td><td>13:00</td><td>14:00</td><td>1.00</td><td>0.0</td><td>New York Genome Center Senior Director, Computational Biology; 13 years at NYGC leading 20 scientists. Runs &gt;10,000 samples/year across short-read and long-read platforms (ONT/PacBio); ~5% methylation, actively benchmarking protocols.</td></tr><tr><td></td><td>Scheduled</td><td></td><td>Dr. Jen-Tsan Chi MD. PhD.</td><td>Duke University Health System, Inc.</td><td></td><td>USA</td><td>$330.00 / hr</td><td>330</td><td>USD</td><td>Guidepoint</td><td>10/06/26</td><td>21:00</td><td>22:00</td><td>1.00</td><td>330.0</td><td>Duke University Professor at the Duke Genome Center/Cancer Institute since 2005. Oncology-focused PI using targeted DNA, targeted methylation, short-read WGS and long-read WGS; very confident in long-read. Runs 2,000–10,000 samples/year, ~30% epigenetic/methylation.</td></tr></tbody></table></div><div class="zone-footer"><span>10 rows pasted</span><button>Clear</button></div></div>
+
+            <div class="button-group">
+                <button class="primary" onclick="loadCalendar()">Load calendar</button>
+                <button onclick="savePage()" id="saveBtn" style="display: inline-block; background: rgb(234, 243, 222); color: rgb(59, 109, 17); border-color: rgb(126, 185, 75);">Save page</button>
+                <button onclick="clearAll()">Clear all</button>
             </div>
-            <div class="angle-block">
-                <label style="color:#A32D2D">Angle 3</label>
-                <div class="paste-zone angle-3 has-data" id="zone3" tabindex="0"><div class="preview-table-wrap"><table class="preview-table"><thead><tr><th>#</th><th>Status</th><th>Profile</th><th>Name</th><th>Company</th><th>Role</th><th>Location</th><th>Cost</th><th></th><th>Cur</th><th>Network</th><th>Date</th><th>Start</th><th>End</th><th>Dur</th><th>Net cost</th></tr></thead><tbody><tr><td>C1</td><td>Completed</td><td></td><td>Dr. Greg Elgar</td><td>Genomics England Limited</td><td></td><td>GBR</td><td>$353.76 / hr</td><td>353.76</td><td>USD</td><td>Genomics England Limited</td><td>05/06/26</td><td>13:30</td><td>14:30</td><td>1.00</td><td>353.8</td><td></td></tr><tr><td></td><td>Scheduled</td><td></td><td>Augusto Rendon</td><td>Genomics England</td><td></td><td>London, UK</td><td>$900 /hr</td><td>900</td><td>USD</td><td>Genomics England</td><td>10/06/26</td><td>16:00</td><td>17:00</td><td>1.00</td><td>900.0</td><td>Genomics England Chief Bioinformatician since 2019; former Director of Bioinformatics and Cambridge research associate. Programme-level population genomics expert with &gt;10,000 genomes/year visibility, using outsourced Illumina short-read and internal ONT long-read WGS. Low methylation exposure today (~1% WGS volume).</td></tr></tbody></table></div><div class="zone-footer"><span>2 rows pasted</span><button>Clear</button></div></div>
-            </div>
+            <div class="error-msg" id="errorMsg" style="display: none;"></div>
+            <div class="success-msg" id="successMsg" style="display: block;">✓ Loaded 24 interviews</div>
         </div>
-
-        <div class="button-group">
-            <button class="primary" onclick="loadCalendar()">Load calendar</button>
-            <button onclick="savePage()" id="saveBtn" style="display: inline-block; background: rgb(234, 243, 222); color: rgb(59, 109, 17); border-color: rgb(126, 185, 75);">Save page</button>
-            <button onclick="clearAll()">Clear all</button>
-        </div>
-        <div class="error-msg" id="errorMsg" style="display: none;"></div>
-        <div class="success-msg" id="successMsg" style="display: block;">✓ Loaded 24 interviews</div>
     </div>
-</div><!-- /tab-input -->
 
-<div id="tab-summary" class="tab-panel">
-    <div id="summaryContent" style="padding: 0.5rem 0;">
+    <div id="tab-summary" class="tab-panel">
+        <div id="summaryContent" style="padding: 0.5rem 0;">
         <div class="summary-block">
             <h3>IV number tracker</h3>
             <div class="summary-row-wrap">
-                <div>
-                    <table class="summary-table">
-                        <thead>
-                            <tr>
-                                <th class="row-header">Number of IVs</th>
-                                <th>In process</th>
-                                <th>Scheduled</th>
-                                <th>Completed</th>
-                                <th>Total</th>
-                            </tr>
-                        </thead>
-                        <tbody><tr>
-            <td class="row-label">Angle 1</td>
-            <td>-</td><td>11</td><td>5</td>
-            <td>16</td>
-        </tr><tr>
-            <td class="row-label a2">Angle 2</td>
-            <td>1</td><td>6</td><td>3</td>
-            <td>10</td>
-        </tr><tr>
-            <td class="row-label a3">Angle 3</td>
-            <td>-</td><td>1</td><td>1</td>
-            <td>2</td>
-        </tr><tr class="total-row">
-        <td class="total-label">TOTAL:</td>
-        <td>1</td><td>18</td><td>9</td>
-        <td>28</td>
-    </tr></tbody>
-                    </table>
-                </div>
-                <div>
-                    <table class="summary-side-table">
-                        <thead><tr><th class="target-cell">Target</th></tr></thead>
-                        <tbody><tr><td class="target-cell">25</td></tr><tr><td class="target-cell">15</td></tr><tr><td class="target-cell">10</td></tr><tr><td style="font-weight:700;">50</td></tr></tbody>
-                    </table>
-                </div>
+                <div><table class="summary-table"><thead><tr><th class="row-header">Number of IVs</th><th>In process</th><th>Scheduled</th><th>Completed</th><th>Total</th></tr></thead><tbody><tr><td class="row-label">Angle 1</td><td>-</td><td>10</td><td>6</td><td>16</td></tr><tr><td class="row-label a2">Angle 2</td><td>1</td><td>6</td><td>3</td><td>10</td></tr><tr><td class="row-label a3">Angle 3</td><td>-</td><td>1</td><td>1</td><td>2</td></tr><tr class="total-row"><td class="total-label">TOTAL:</td><td>1</td><td>17</td><td>10</td><td>28</td></tr></tbody></table></div>
+                <div><table class="summary-side-table"><thead><tr><th class="target-cell">Target</th></tr></thead><tbody><tr><td class="target-cell">25</td></tr><tr><td class="target-cell">15</td></tr><tr><td class="target-cell">10</td></tr><tr><td style="font-weight:700;">50</td></tr></tbody></table></div>
             </div>
         </div>
-
         <div class="summary-block">
             <h3>IV cost tracker (USD)</h3>
             <div class="summary-row-wrap">
-                <div>
-                    <table class="summary-table">
-                        <thead>
-                            <tr>
-                                <th class="row-header">Cost of IVs USD</th>
-                                <th>In process</th>
-                                <th>Scheduled</th>
-                                <th>Completed</th>
-                                <th>Total (USD)</th>
-                            </tr>
-                        </thead>
-                        <tbody><tr>
-            <td class="row-label">Angle 1</td>
-            <td>-</td><td>6,966</td><td>3,523</td>
-            <td>10,488</td>
-        </tr><tr>
-            <td class="row-label a2">Angle 2</td>
-            <td>317</td><td>2,244</td><td>911</td>
-            <td>3,472</td>
-        </tr><tr>
-            <td class="row-label a3">Angle 3</td>
-            <td>-</td><td>900</td><td>354</td>
-            <td>1,254</td>
-        </tr><tr class="total-row">
-        <td class="total-label">Total</td>
-        <td>317</td><td>10,110</td><td>4,787</td>
-        <td>15,214</td>
-    </tr></tbody>
-                    </table>
-                </div>
-                <div>
-                    <table class="summary-side-table">
-                        <thead>
-                            <tr>
-                                <th>Guidepoint total</th>
-                                <th>Atheneum total</th>
-                                <th>Synquery total</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr><td>7,660</td><td>900</td><td>5,400</td></tr>
-                        </tbody>
-                    </table>
-                </div>
+                <div><table class="summary-table"><thead><tr><th class="row-header">Cost of IVs USD</th><th>In process</th><th>Scheduled</th><th>Completed</th><th>Total (USD)</th></tr></thead><tbody><tr><td class="row-label">Angle 1</td><td>-</td><td>6,066</td><td>4,423</td><td>10,488</td></tr><tr><td class="row-label a2">Angle 2</td><td>317</td><td>2,244</td><td>911</td><td>3,472</td></tr><tr><td class="row-label a3">Angle 3</td><td>-</td><td>900</td><td>354</td><td>1,254</td></tr><tr class="total-row"><td class="total-label">Total</td><td>317</td><td>9,210</td><td>5,687</td><td>15,214</td></tr></tbody></table></div>
+                <div><table class="summary-side-table"><thead><tr><th>Guidepoint total</th><th>Atheneum total</th><th>Synquery total</th></tr></thead><tbody><tr><td>7,660</td><td>900</td><td>5,400</td></tr></tbody></table></div>
+            </div>
+        </div></div>
+    </div>
+
+    <div id="tab-definitions" class="tab-panel">
+        <div style="max-width: 800px;">
+            <div class="angle-def a1">
+                <h3>Angle 1 – Biopharma R&amp;D</h3>
+                <ul>
+                    <li class="def-l1">1. Biopharma / biotech companies R&amp;D – sequencing workflow specialists</li>
+                    <li class="def-l2">a. Biologics early discovery</li>
+                    <li class="def-l3">Principal Scientist / Senior Scientist, Antibody Discovery or Antibody Engineering</li>
+                    <li class="def-l3">Director / Principal Scientist, Protein Engineering or Biologics Discovery</li>
+                    <li class="def-l3">Principal Scientist / Director, mRNA, Vaccine or Nucleic Acid Therapeutics R&amp;D</li>
+                    <li class="def-l3">Lab Head / Group Lead, Biologics Discovery</li>
+                    <li class="def-l2">b. Cell and gene therapy early discovery</li>
+                    <li class="def-l3">Principal Scientist / Director, AAV or Viral Vector Development / Lentiviral Vector Development / Cell Therapy Engineering</li>
+                    <li class="def-l3">Director / Senior Director, Gene Therapy or Cell Therapy R&amp;D</li>
+                    <li class="def-l1">2. Contract Research Organisation / services companies – sequencing workflow specialists</li>
+                    <li class="def-l2">a. Biopharma R&amp;D – servicing</li>
+                    <li class="def-l3">Director / Business Unit Head, Sequencing Services</li>
+                    <li class="def-l3">Principal Scientist, Genomics</li>
+                    <li class="def-l3">Site Head, Genomics Services</li>
+                    <li class="def-l3">Strategic Technology Lead</li>
+                </ul>
+            </div>
+            <div class="angle-def a2">
+                <h3>Angle 2 – Research (academia)</h3>
+                <ul>
+                    <li class="def-l1">1. Genomics core / sequencing facility decision-makers</li>
+                    <li class="def-l2">a. Genomics Core Facility Director</li>
+                    <li class="def-l2">b. Sequencing Facility Head</li>
+                    <li class="def-l2">c. NGS Platform Lead</li>
+                    <li class="def-l2">d. Omics Technology Director</li>
+                    <li class="def-l1">2. Research group end users / demand generators</li>
+                    <li class="def-l2">a. PI / Group Leader / senior researcher, Human Genetics / Cancer Genomics / Rare Disease Genomics / Epigenomics / Regulatory Genomics</li>
+                </ul>
+            </div>
+            <div class="angle-def a3">
+                <h3>Angle 3 – Research (population genomics)</h3>
+                <ul>
+                    <li class="def-l1">1. Population genomics programmes / consortia</li>
+                    <li class="def-l2">a. Programme Director, Population Genomics</li>
+                    <li class="def-l2">b. Scientific Director / Chief Scientist, Genomics Programme</li>
+                    <li class="def-l2">c. Consortium Scientific Lead / Genomics Strategy Lead</li>
+                    <li class="def-l1">2. Biobanks / cohort owners</li>
+                    <li class="def-l2">a. Director of Genomics, Biobank</li>
+                    <li class="def-l2">b. Head of Cohort Genomics / Omics Programme Director</li>
+                    <li class="def-l2">c. Biobank Scientific Director / Cohort Principal Investigator</li>
+                    <li class="def-l1">3. Genome centres (academic / national genome centres, excluding sequencing service providers)</li>
+                    <li class="def-l2">a. Director of Sequencing Operations</li>
+                    <li class="def-l2">b. Head of Genome Sequencing / Production Genomics</li>
+                    <li class="def-l2">c. Head of Population Sequencing</li>
+                </ul>
             </div>
         </div>
     </div>
+
 </div>
-
-<div id="tab-definitions" class="tab-panel">
-    <div style="max-width: 800px;">
-
-        <div class="angle-def a1">
-            <h3>Angle 1 – Biopharma R&amp;D</h3>
-            <ul>
-                <li class="def-l1">1. Biopharma / biotech companies R&amp;D – sequencing workflow specialists</li>
-                <li class="def-l2">a. Biologics early discovery</li>
-                <li class="def-l3">Principal Scientist / Senior Scientist, Antibody Discovery or Antibody Engineering</li>
-                <li class="def-l3">Director / Principal Scientist, Protein Engineering or Biologics Discovery</li>
-                <li class="def-l3">Principal Scientist / Director, mRNA, Vaccine or Nucleic Acid Therapeutics R&amp;D</li>
-                <li class="def-l3">Lab Head / Group Lead, Biologics Discovery</li>
-                <li class="def-l2">b. Cell and gene therapy early discovery</li>
-                <li class="def-l3">Principal Scientist / Director, AAV or Viral Vector Development / Lentiviral Vector Development / Cell Therapy Engineering</li>
-                <li class="def-l3">Director / Senior Director, Gene Therapy or Cell Therapy R&amp;D</li>
-                <li class="def-l1">2. Contract Research Organisation / services companies – sequencing workflow specialists</li>
-                <li class="def-l2">a. Biopharma R&amp;D – servicing</li>
-                <li class="def-l3">Director / Business Unit Head, Sequencing Services</li>
-                <li class="def-l3">Principal Scientist, Genomics</li>
-                <li class="def-l3">Site Head, Genomics Services</li>
-                <li class="def-l3">Strategic Technology Lead</li>
-            </ul>
-        </div>
-
-        <div class="angle-def a2">
-            <h3>Angle 2 – Research (academia)</h3>
-            <ul>
-                <li class="def-l1">1. Genomics core / sequencing facility decision-makers</li>
-                <li class="def-l2">a. Genomics Core Facility Director</li>
-                <li class="def-l2">b. Sequencing Facility Head</li>
-                <li class="def-l2">c. NGS Platform Lead</li>
-                <li class="def-l2">d. Omics Technology Director</li>
-                <li class="def-l1">2. Research group end users / demand generators</li>
-                <li class="def-l2">a. PI / Group Leader / senior researcher, Human Genetics / Cancer Genomics / Rare Disease Genomics / Epigenomics / Regulatory Genomics</li>
-            </ul>
-        </div>
-
-        <div class="angle-def a3">
-            <h3>Angle 3 – Research (population genomics)</h3>
-            <ul>
-                <li class="def-l1">1. Population genomics programmes / consortia</li>
-                <li class="def-l2">a. Programme Director, Population Genomics</li>
-                <li class="def-l2">b. Scientific Director / Chief Scientist, Genomics Programme</li>
-                <li class="def-l2">c. Consortium Scientific Lead / Genomics Strategy Lead</li>
-                <li class="def-l1">2. Biobanks / cohort owners</li>
-                <li class="def-l2">a. Director of Genomics, Biobank</li>
-                <li class="def-l2">b. Head of Cohort Genomics / Omics Programme Director</li>
-                <li class="def-l2">c. Biobank Scientific Director / Cohort Principal Investigator</li>
-                <li class="def-l1">3. Genome centres (academic / national genome centres, excluding sequencing service providers)</li>
-                <li class="def-l2">a. Director of Sequencing Operations</li>
-                <li class="def-l2">b. Head of Genome Sequencing / Production Genomics</li>
-                <li class="def-l2">c. Head of Population Sequencing</li>
-            </ul>
-        </div>
-
-    </div>
-</div><!-- /tab-definitions -->
 
 <div class="modal-overlay" id="modal">
     <div class="modal-box">
@@ -995,17 +1100,15 @@ const COLS = {
 
 const HOURS = Array.from({length: 13}, (_, i) => i + 8);
 
-let rawData = {"1":[["A1","Completed","1aiv","Dr. Tanima Bose","Novartis AG","","DEU","$612.48 / hr","612.48","USD","Guidepoint","01/06/26","15:00","16:15","1.25","765.6","Novartis (03/2022–present; GMP Quality lead since 03/2025); antibodies/biologics, CTx, GTx, mRNA. Uses long-read NGS externally. Covers target discovery through drug design, characterization, CMC/QC, clinical development. Cluster a/b.\r"],["A2","Completed","1aii","Dr. Bat-Erdene Jugder","AstraZeneca PLC","","USA","$396.00 / hr","396","USD","Guidepoint","02/06/26","17:30","18:40","1.17","462.0","AstraZeneca (06/2023–present), Target Discovery Team Lead in immunology; antibodies/biologics and CTx. Uses long-read NGS. Strongest in target discovery and lead/cell-line characterization, with broader discovery/CMC visibility. Cluster a.\r"],["A3","Completed","1aiii","Mrs. Jigesha Dholakia","Bayer Aktiengesellschaft","","USA","$495.00 / hr","495","USD","Guidepoint","02/06/26","19:00","20:00","1.00","495.0","Bayer (07/2023–present), CMC Analytical Strategy Director; specializes in CTx and GTx. Uses long-read NGS. Focused on construct/vector build, product characterization, CMC, QC-adjacent workflows, and clinical development. Cluster c.\r"],["","Scheduled","","Dr. Giacomo Tampella","BrainChild Bio, Inc.","","USA","$132.00 / hr","132","USD","Guidepoint","","","","1.00","132.0","BrainChild Bio-listed Principal Scientist; prior Pfizer Principal Scientist (05/2023–05/2025). Specializes in antibodies/biologics, CTx, and GTx. Uses long-read NGS. Focused on target discovery, construct/vector build, and hPSC clone characterization. Cluster b/c.\r"],["","Scheduled","","Dr. Xiangming Li","Cartesian Therapeutics, Inc.","","USA","$578.16 / hr","578.16","USD","Guidepoint","16/06/26","15:00","16:00","1.00","578.2","Cartesian Therapeutics (01/2024–present), Bioprocess Development Director on mRNA CAR-T; biologics/antibody platform background. Uses long-read NGS. Focused on construct/vector build, cell-line characterization, CMC, QC, and early clinical workflows. Cluster c.\r"],["","Scheduled","","Mr. Adrian Lau","Eli Lilly and Company","","USA","$369.60 / hr","369.6","USD","Guidepoint","12/06/26","19:00","20:00","1.00","369.6","Eli Lilly (10/2022–present), Principal Scientist in preclinical gene therapy/AAV. Specializes in GTx and mRNA/nucleic acids. Uses long-read NGS externally. Focused on target discovery, expression profiling, QC, and biology understanding. Cluster a.\r"],["","Scheduled","","Wei Guo","Amgen (Jul 2023 - Now)","N/A","United States","$900 / hr","900","USD","Atheneum","","","","1.00","900.0","Amgen (07/2023–present as Senior Scientist; 09/2020–present overall), biologics/antibodies, mRNA/nucleic acids, small molecules. No long-read use stated. Focused on target discovery, drug design, CRISPR knockout, and cell-line validation. Cluster a.\r"],["","Scheduled","","Dr. Purushotham Reddy Koppula","Regeneron Pharmaceuticals, Inc.","","USA","$858.00 / hr","858","USD","Guidepoint","10/06/26","20:00","21:00","1.00","858.0","Regeneron (01/2020–present), Research Program Manager; antibodies/biologics, CTx, GTx, mRNA. Uses long-read sequencing. Broad visibility across target discovery, drug design, characterization, CMC/QC, clinical development, and rare disease/cell therapy. Cluster a/b/c.\r"],["","Scheduled","","Dr. Ofer Yizhar Barnea","Scribe Therapeutics Inc.","\" - Manager of Functional Genomics:64x Bio    (07/2023 to 12/2023)  - Founder:Geneyx Genomex Ltd    (06/2021 to 07/2023)\"","USA","$330.00 / hr","330","USD","Guidepoint","10/06/26","18:30","19:30","1.00","330.0","Scribe Therapeutics (03/2024–present), Senior Scientist developing CRISPR/off-target strategies; CTx and GTx. Uses long-read NGS. Focused on target discovery, construct/vector build, lead/cell-line characterization, and translational science. Cluster b/c.\r"],["","Scheduled","","Dr. Ravi Dyavar","Adicet Bio, Inc.","","USA","$198.00 / hr","198","USD","Guidepoint","11/06/26","16:00","17:00","1.00","198.0","Adicet Bio (01/2021–present; Principal Scientist since 07/2024), CTx specialist. Uses long-read NGS. Covers target discovery, drug design, construct/vector build, product characterization, CMC/QC, clinical development, and potency gene-expression analysis. Cluster c.\r"],["A5","Completed","","Pankaj Soni","Cibus","","San Diego, CA","$900 /hr","900","USD","Synquery","09/06/26","15:00","16:00","1.00","900.0","Cibus (2025–present), Senior Director Molecular Discovery; prior Pfizer (2014–2022). Specializes in antibodies/biologics and mRNA/nucleic acids. Long-read not specified. Covers target discovery through CMC/QC, clinical development, construct verification, and cell-line characterization. Cluster a/b/c.\r"],["","Scheduled","","Daniel Cirera-Salinas","Novartis","","Basel, Switzerland","$900 /hr","900","USD","Synquery","10/06/26","14:00","15:00","1.00","900.0","Novartis (2018–present), Head of Biologics Analytical R&D; antibodies/biologics, CTx, GTx, mRNA. Long-read not specified. Covers target discovery through BLA, sequence confirmation, cell-line/clonality assessment, biomarkers, and patient stratification. Cluster a/b/c.\r"],["","Scheduled","","Paul Robbins","Allogene Therapeutics","","San Francisco, CA","$900 /hr","900","USD","Synquery","12/06/26","16:30","17:30","1.00","900.0","Allogene Therapeutics (2023–present), VP Translational Sciences; CTx-focused with biologics/antibody and GTx overlap. Long-read not specified. Covers target discovery, construct/vector build, characterization, CMC/QC, clinical, donor/product characterization, and response analysis. Cluster b/c.\r"],["","Scheduled","","Marcin Ura, PhD","Monod Bio","","Cambridge, MA","$900 /hr","900","USD","Synquery","10/06/26","17:00","18:00","1.00","900.0","Monod Bio (current), Principal Scientist in antibody engineering/lead optimization; antibodies/biologics specialist. Long-read not specified. Focused on drug design, lead characterization, CMC-adjacent workflows, construct verification, and library QC. Cluster a.\r"],["A4","Completed","","Laurent Poirot","Cellectis","","Paris, France","$900 /hr","900","USD","Synquery","09/06/26","12:00","13:00","1.00","900.0","Cellectis (2020–present; SVP Immunology/Translational Research Lead since 2025), allogeneic CAR-T CTx, GTx, and antibodies. Long-read not specified. Focused on target discovery, drug design, construct/vector build, NGS and TCR sequencing. Cluster a/b.\r"],["","Scheduled","","Hitesh Arora","Absci","","Portland, OR","$900 /hr","900","USD","Synquery","15/06/26","13:00","14:00","1.00","900.0","Absci (2025–present), Senior Scientist Immunology; antibodies/biologics including mAbs, bispecifics, VHHs/nanobodies. Long-read not specified. Focused on target identification/validation, functional asset development, efficacy, PKPD, immunogenicity, and NGS splice variants. Cluster a."]],"2":[["B2","Completed","","Dr. Maximilian Krause","TUD Dresden University of Technology","","DEU","$382.80 / hr","382.8","USD","Guidepoint","09/06/26","10:00","11:00","1.00","382.8","TUD Dresden / Dresden-concept Genome Center leader since 2021; genomics core director. Supports targeted DNA, targeted methylation, short-read WGS and WGS+methylation; highly confident in long-read. Low annual volume (<100), ~10% methylation.\r"],["","In Process","","Mr. Brewster Kingham","University of Delaware","","USA","$316.80 / hr","316.8","USD","Guidepoint","","","","1.00","316.8","University of Delaware Sequencing & Genotyping Center Director with 35 years in genomics. Oversees ONT, PacBio, Illumina, Element and 10X platforms; uses targeted DNA, methylation, short/long-read WGS and WGS+methylation. 500–2,000 samples/year, ~65% methylation.\r"],["","Scheduled","","Dr. Nicholas Beckloff PhD, PMP","University of Louisville","","USA","$429.00 / hr","429","USD","Guidepoint","","","","1.00","429.0","University of Louisville Sequencing Translational Center Director (01/2025–present); former ONT field application specialist and genomics core director. Uses targeted DNA, methylation, short-read, long-read WGS and WGS+methylation; 500–2,000 samples/year.\r"],["","Scheduled","","Dr. Stacey Gabriel PhD","Broad Institute","","USA","$627.00 / hr","627","USD","Guidepoint","11/06/26","14:00","15:00","1.00","627.0","Broad Institute EVP, Head of Platforms (09/2023–present); Broad genomics platform leader since 1998. Uses targeted DNA, methylation, short-read WGS, long-read WGS and WGS+methylation; >10,000 samples/year, ~10% methylation.\r"],["B1","Completed","","Dr. Graham Johnson","Duke Human Vaccine Institute","","USA","$528.00 / hr","528","USD","Guidepoint","04/06/26","18:00","19:00","1.00","528.0","\r"],["","Scheduled","","Dr. Sraboni Chaudhury","Research Scientist","","USA","$330.00 / hr","330","USD","Guidepoint","11/06/26","15:00","16:00","1.00","330.0","University of Michigan Research Scientist (12/2010–present), academic genomics platform scientist. Uses targeted DNA, methylation, short-read and long-read WGS; high workflow confidence. Runs 500–2,000 samples/year with ~70% methylation.\r"],["","Scheduled","","Dr. Eric Vilain","University of California Irvine Health","","USA","$528.00 / hr","528","USD","Guidepoint","16/06/26","19:00","20:00","1.00","528.0","UC Irvine Associate Vice Chancellor / Pediatrics Professor with genomics and precision medicine leadership. Uses targeted DNA, targeted methylation, short-read WGS, long-read WGS and WGS+methylation; highly confident across workflows. 500–2,000 samples/year, ~50% methylation.\r"],["","Scheduled","","Hsiao-yun (Christy) Milliron","Van Andel Institute","","Grand Rapids, MI","$900/hr","0","USD","Synquery","12/06/26","13:00","14:00","1.00","0.0","Van Andel Institute methylation specialist, 12 years total; Research Scientist in Epigenetics. Uses WGBS, methylation/SNP arrays and single-cell multi-omics; no long-read noted. ~5,000 samples/year, ~100% methylation-focused.\r"],["B3","Completed","","Nicolas Robine","New York Genome Center","","New York, NY","$900/hr","0","USD","Synquery","09/06/26","13:00","14:00","1.00","0.0","New York Genome Center Senior Director, Computational Biology; 13 years at NYGC leading 20 scientists. Runs >10,000 samples/year across short-read and long-read platforms (ONT/PacBio); ~5% methylation, actively benchmarking protocols.\r"],["","Scheduled","","Dr. Jen-Tsan Chi MD. PhD.","Duke University Health System, Inc.","","USA","$330.00 / hr","330","USD","Guidepoint","10/06/26","21:00","22:00","1.00","330.0","Duke University Professor at the Duke Genome Center/Cancer Institute since 2005. Oncology-focused PI using targeted DNA, targeted methylation, short-read WGS and long-read WGS; very confident in long-read. Runs 2,000–10,000 samples/year, ~30% epigenetic/methylation."]],"3":[["C1","Completed","","Dr. Greg Elgar","Genomics England Limited","","GBR","$353.76 / hr","353.76","USD","Genomics England Limited","05/06/26","13:30","14:30","1.00","353.8","\r"],["","Scheduled","","Augusto Rendon","Genomics England","","London, UK","$900 /hr","900","USD","Genomics England","10/06/26","16:00","17:00","1.00","900.0","Genomics England Chief Bioinformatician since 2019; former Director of Bioinformatics and Cambridge research associate. Programme-level population genomics expert with >10,000 genomes/year visibility, using outsourced Illumina short-read and internal ONT long-read WGS. Low methylation exposure today (~1% WGS volume)."]]};
+let rawData = {"1":[["A1","Completed","1aiv","Dr. Tanima Bose","Novartis AG","","DEU","$612.48 / hr","612.48","USD","Guidepoint","01/06/26","15:00","16:15","1.25","765.6","Novartis (03/2022–present; GMP Quality lead since 03/2025); antibodies/biologics, CTx, GTx, mRNA. Uses long-read NGS externally. Covers target discovery through drug design, characterization, CMC/QC, clinical development. Cluster a/b.\r"],["A2","Completed","1aii","Dr. Bat-Erdene Jugder","AstraZeneca PLC","","USA","$396.00 / hr","396","USD","Guidepoint","02/06/26","17:30","18:40","1.17","462.0","AstraZeneca (06/2023–present), Target Discovery Team Lead in immunology; antibodies/biologics and CTx. Uses long-read NGS. Strongest in target discovery and lead/cell-line characterization, with broader discovery/CMC visibility. Cluster a.\r"],["A3","Completed","1aiii","Mrs. Jigesha Dholakia","Bayer Aktiengesellschaft","","USA","$495.00 / hr","495","USD","Guidepoint","02/06/26","19:00","20:00","1.00","495.0","Bayer (07/2023–present), CMC Analytical Strategy Director; specializes in CTx and GTx. Uses long-read NGS. Focused on construct/vector build, product characterization, CMC, QC-adjacent workflows, and clinical development. Cluster c.\r"],["","Scheduled","","Dr. Giacomo Tampella","BrainChild Bio, Inc.","","USA","$132.00 / hr","132","USD","Guidepoint","","","","1.00","132.0","BrainChild Bio-listed Principal Scientist; prior Pfizer Principal Scientist (05/2023–05/2025). Specializes in antibodies/biologics, CTx, and GTx. Uses long-read NGS. Focused on target discovery, construct/vector build, and hPSC clone characterization. Cluster b/c.\r"],["","Scheduled","","Dr. Xiangming Li","Cartesian Therapeutics, Inc.","","USA","$578.16 / hr","578.16","USD","Guidepoint","16/06/26","15:00","16:00","1.00","578.2","Cartesian Therapeutics (01/2024–present), Bioprocess Development Director on mRNA CAR-T; biologics/antibody platform background. Uses long-read NGS. Focused on construct/vector build, cell-line characterization, CMC, QC, and early clinical workflows. Cluster c.\r"],["","Scheduled","","Mr. Adrian Lau","Eli Lilly and Company","","USA","$369.60 / hr","369.6","USD","Guidepoint","12/06/26","19:00","20:00","1.00","369.6","Eli Lilly (10/2022–present), Principal Scientist in preclinical gene therapy/AAV. Specializes in GTx and mRNA/nucleic acids. Uses long-read NGS externally. Focused on target discovery, expression profiling, QC, and biology understanding. Cluster a.\r"],["","Scheduled","","Wei Guo","Amgen (Jul 2023 - Now)","N/A","United States","$900 / hr","900","USD","Atheneum","","","","1.00","900.0","Amgen (07/2023–present as Senior Scientist; 09/2020–present overall), biologics/antibodies, mRNA/nucleic acids, small molecules. No long-read use stated. Focused on target discovery, drug design, CRISPR knockout, and cell-line validation. Cluster a.\r"],["","Scheduled","","Dr. Purushotham Reddy Koppula","Regeneron Pharmaceuticals, Inc.","","USA","$858.00 / hr","858","USD","Guidepoint","10/06/26","20:00","21:00","1.00","858.0","Regeneron (01/2020–present), Research Program Manager; antibodies/biologics, CTx, GTx, mRNA. Uses long-read sequencing. Broad visibility across target discovery, drug design, characterization, CMC/QC, clinical development, and rare disease/cell therapy. Cluster a/b/c.\r"],["","Scheduled","","Dr. Ofer Yizhar Barnea","Scribe Therapeutics Inc.","\" - Manager of Functional Genomics:64x Bio    (07/2023 to 12/2023)  - Founder:Geneyx Genomex Ltd    (06/2021 to 07/2023)\"","USA","$330.00 / hr","330","USD","Guidepoint","10/06/26","18:30","19:30","1.00","330.0","Scribe Therapeutics (03/2024–present), Senior Scientist developing CRISPR/off-target strategies; CTx and GTx. Uses long-read NGS. Focused on target discovery, construct/vector build, lead/cell-line characterization, and translational science. Cluster b/c.\r"],["","Scheduled","","Dr. Ravi Dyavar","Adicet Bio, Inc.","","USA","$198.00 / hr","198","USD","Guidepoint","11/06/26","16:00","17:00","1.00","198.0","Adicet Bio (01/2021–present; Principal Scientist since 07/2024), CTx specialist. Uses long-read NGS. Covers target discovery, drug design, construct/vector build, product characterization, CMC/QC, clinical development, and potency gene-expression analysis. Cluster c.\r"],["A5","Completed","","Pankaj Soni","Cibus","","San Diego, CA","$900 /hr","900","USD","Synquery","09/06/26","15:00","16:00","1.00","900.0","Cibus (2025–present), Senior Director Molecular Discovery; prior Pfizer (2014–2022). Specializes in antibodies/biologics and mRNA/nucleic acids. Long-read not specified. Covers target discovery through CMC/QC, clinical development, construct verification, and cell-line characterization. Cluster a/b/c.\r"],["A6","Completed","","Daniel Cirera-Salinas","Novartis","","Basel, Switzerland","$900 /hr","900","USD","Synquery","10/06/26","14:00","15:00","1.00","900.0","Novartis (2018–present), Head of Biologics Analytical R&D; antibodies/biologics, CTx, GTx, mRNA. Long-read not specified. Covers target discovery through BLA, sequence confirmation, cell-line/clonality assessment, biomarkers, and patient stratification. Cluster a/b/c.\r"],["","Scheduled","","Paul Robbins","Allogene Therapeutics","","San Francisco, CA","$900 /hr","900","USD","Synquery","12/06/26","16:30","17:30","1.00","900.0","Allogene Therapeutics (2023–present), VP Translational Sciences; CTx-focused with biologics/antibody and GTx overlap. Long-read not specified. Covers target discovery, construct/vector build, characterization, CMC/QC, clinical, donor/product characterization, and response analysis. Cluster b/c.\r"],["","Scheduled","","Marcin Ura, PhD","Monod Bio","","Cambridge, MA","$900 /hr","900","USD","Synquery","10/06/26","17:00","18:00","1.00","900.0","Monod Bio (current), Principal Scientist in antibody engineering/lead optimization; antibodies/biologics specialist. Long-read not specified. Focused on drug design, lead characterization, CMC-adjacent workflows, construct verification, and library QC. Cluster a.\r"],["A4","Completed","","Laurent Poirot","Cellectis","","Paris, France","$900 /hr","900","USD","Synquery","09/06/26","12:00","13:00","1.00","900.0","Cellectis (2020–present; SVP Immunology/Translational Research Lead since 2025), allogeneic CAR-T CTx, GTx, and antibodies. Long-read not specified. Focused on target discovery, drug design, construct/vector build, NGS and TCR sequencing. Cluster a/b.\r"],["","Scheduled","","Hitesh Arora","Absci","","Portland, OR","$900 /hr","900","USD","Synquery","15/06/26","13:00","14:00","1.00","900.0","Absci (2025–present), Senior Scientist Immunology; antibodies/biologics including mAbs, bispecifics, VHHs/nanobodies. Long-read not specified. Focused on target identification/validation, functional asset development, efficacy, PKPD, immunogenicity, and NGS splice variants. Cluster a."]],"2":[["B2","Completed","","Dr. Maximilian Krause","TUD Dresden University of Technology","","DEU","$382.80 / hr","382.8","USD","Guidepoint","09/06/26","10:00","11:00","1.00","382.8","TUD Dresden / Dresden-concept Genome Center leader since 2021; genomics core director. Supports targeted DNA, targeted methylation, short-read WGS and WGS+methylation; highly confident in long-read. Low annual volume (<100), ~10% methylation.\r"],["","In Process","","Mr. Brewster Kingham","University of Delaware","","USA","$316.80 / hr","316.8","USD","Guidepoint","","","","1.00","316.8","University of Delaware Sequencing & Genotyping Center Director with 35 years in genomics. Oversees ONT, PacBio, Illumina, Element and 10X platforms; uses targeted DNA, methylation, short/long-read WGS and WGS+methylation. 500–2,000 samples/year, ~65% methylation.\r"],["","Scheduled","","Dr. Nicholas Beckloff PhD, PMP","University of Louisville","","USA","$429.00 / hr","429","USD","Guidepoint","","","","1.00","429.0","University of Louisville Sequencing Translational Center Director (01/2025–present); former ONT field application specialist and genomics core director. Uses targeted DNA, methylation, short-read, long-read WGS and WGS+methylation; 500–2,000 samples/year.\r"],["","Scheduled","","Dr. Stacey Gabriel PhD","Broad Institute","","USA","$627.00 / hr","627","USD","Guidepoint","10/06/26","17:00","18:00","1.00","627.0","Broad Institute EVP, Head of Platforms (09/2023–present); Broad genomics platform leader since 1998. Uses targeted DNA, methylation, short-read WGS, long-read WGS and WGS+methylation; >10,000 samples/year, ~10% methylation.\r"],["B1","Completed","","Dr. Graham Johnson","Duke Human Vaccine Institute","","USA","$528.00 / hr","528","USD","Guidepoint","04/06/26","18:00","19:00","1.00","528.0","\r"],["","Scheduled","","Dr. Sraboni Chaudhury","Research Scientist","","USA","$330.00 / hr","330","USD","Guidepoint","11/06/26","15:00","16:00","1.00","330.0","University of Michigan Research Scientist (12/2010–present), academic genomics platform scientist. Uses targeted DNA, methylation, short-read and long-read WGS; high workflow confidence. Runs 500–2,000 samples/year with ~70% methylation.\r"],["","Scheduled","","Dr. Eric Vilain","University of California Irvine Health","","USA","$528.00 / hr","528","USD","Guidepoint","16/06/26","19:00","20:00","1.00","528.0","UC Irvine Associate Vice Chancellor / Pediatrics Professor with genomics and precision medicine leadership. Uses targeted DNA, targeted methylation, short-read WGS, long-read WGS and WGS+methylation; highly confident across workflows. 500–2,000 samples/year, ~50% methylation.\r"],["","Scheduled","","Hsiao-yun (Christy) Milliron","Van Andel Institute","","Grand Rapids, MI","$900/hr","0","USD","Synquery","12/06/26","13:00","14:00","1.00","0.0","Van Andel Institute methylation specialist, 12 years total; Research Scientist in Epigenetics. Uses WGBS, methylation/SNP arrays and single-cell multi-omics; no long-read noted. ~5,000 samples/year, ~100% methylation-focused.\r"],["B3","Completed","","Nicolas Robine","New York Genome Center","","New York, NY","$900/hr","0","USD","Synquery","09/06/26","13:00","14:00","1.00","0.0","New York Genome Center Senior Director, Computational Biology; 13 years at NYGC leading 20 scientists. Runs >10,000 samples/year across short-read and long-read platforms (ONT/PacBio); ~5% methylation, actively benchmarking protocols.\r"],["","Scheduled","","Dr. Jen-Tsan Chi MD. PhD.","Duke University Health System, Inc.","","USA","$330.00 / hr","330","USD","Guidepoint","10/06/26","21:00","22:00","1.00","330.0","Duke University Professor at the Duke Genome Center/Cancer Institute since 2005. Oncology-focused PI using targeted DNA, targeted methylation, short-read WGS and long-read WGS; very confident in long-read. Runs 2,000–10,000 samples/year, ~30% epigenetic/methylation."]],"3":[["C1","Completed","","Dr. Greg Elgar","Genomics England Limited","","GBR","$353.76 / hr","353.76","USD","Genomics England Limited","05/06/26","13:30","14:30","1.00","353.8","\r"],["","Scheduled","","Augusto Rendon","Genomics England","","London, UK","$900 /hr","900","USD","Genomics England","10/06/26","16:00","17:00","1.00","900.0","Genomics England Chief Bioinformatician since 2019; former Director of Bioinformatics and Cambridge research associate. Programme-level population genomics expert with >10,000 genomes/year visibility, using outsourced Illumina short-read and internal ONT long-read WGS. Low methylation exposure today (~1% WGS volume)."]]};
 window.addEventListener('DOMContentLoaded', function() {
   [1,2,3].forEach(function(a) {
-    if (rawData[a] && rawData[a].length) {
-      renderZonePreview(document.getElementById('zone'+a), rawData[a], a);
-    }
+    if (rawData[a] && rawData[a].length) renderZonePreview(document.getElementById('zone'+a), rawData[a], a);
   });
   loadCalendar();
 });
 let interviews = [];
-let allRows = []; // all rows including those without date/time
+let allRows = [];
 let weekStart = getMonday(new Date());
 
 function getMonday(d) {
@@ -1024,22 +1127,39 @@ function setupZone(zoneId, angleNum) {
     });
 
     zone.addEventListener('blur', () => {
-        if (!zone.classList.contains('has-data')) {
-            zone.classList.add('empty-hint');
-        }
+        if (!zone.classList.contains('has-data')) zone.classList.add('empty-hint');
     });
+
+    zone.setAttribute('contenteditable', 'true');
 
     zone.addEventListener('paste', e => {
-        e.preventDefault();
-        const text = e.clipboardData.getData('text/plain');
-        if (!text.trim()) return;
+        // Try standard clipboardData
+        let text = '';
+        try { text = (e.clipboardData || window.clipboardData).getData('text/plain'); } catch(err) {}
 
-        // Collapse quoted fields containing embedded newlines before splitting rows
-        const cleaned = text.trim().replace(/"[^"]*"/gs, m => m.replace(/\n/g, ' ').replace(/\t/g, ' '));
-        const rows = cleaned.split('\n').map(r => r.split('\t'));
-        rawData[angleNum] = rows;
-        renderZonePreview(zone, rows, angleNum);
+        if (text.trim()) {
+            e.preventDefault();
+            processZoneText(text, zone, angleNum);
+        } else {
+            // Fallback: let browser paste into DOM, then harvest
+            e.preventDefault();
+            const pasted = e.clipboardData ? e.clipboardData.getData('text') : '';
+            if (pasted.trim()) { processZoneText(pasted, zone, angleNum); return; }
+            // Last resort: read DOM after paste
+            document.execCommand('insertHTML', false, e.clipboardData ? e.clipboardData.getData('text/html') : '');
+            setTimeout(() => {
+                const t = zone.innerText || zone.textContent || '';
+                if (t.trim()) processZoneText(t, zone, angleNum);
+            }, 50);
+        }
     });
+}
+
+function processZoneText(text, zone, angleNum) {
+    const cleaned = text.trim().replace(/"[^"]*"/gs, m => m.replace(/\n/g, ' ').replace(/\t/g, ' '));
+    const rows = cleaned.split('\n').map(r => r.split('\t'));
+    rawData[angleNum] = rows;
+    renderZonePreview(zone, rows, angleNum);
 }
 
 function renderZonePreview(zone, rows, angleNum) {
@@ -1057,11 +1177,7 @@ function renderZonePreview(zone, rows, angleNum) {
 
     const thead = document.createElement('thead');
     const hrow = document.createElement('tr');
-    headers.forEach(h => {
-        const th = document.createElement('th');
-        th.textContent = h;
-        hrow.appendChild(th);
-    });
+    headers.forEach(h => { const th = document.createElement('th'); th.textContent = h; hrow.appendChild(th); });
     thead.appendChild(hrow);
     tbl.appendChild(thead);
 
@@ -1086,6 +1202,8 @@ function renderZonePreview(zone, rows, angleNum) {
     clr.textContent = 'Clear';
     clr.onclick = () => {
         rawData[angleNum] = [];
+        interviews = interviews.filter(iv => iv.angle !== angleNum);
+        allRows = allRows.filter(iv => iv.angle !== angleNum);
         zone.classList.remove('has-data');
         zone.classList.add('empty-hint');
         zone.innerHTML = '';
@@ -1109,55 +1227,38 @@ function loadCalendar() {
     }
 
     weekStart = getMonday(new Date());
-    renderCalendar();
     document.getElementById('calendarSection').style.display = 'block';
     document.getElementById('saveBtn').style.display = 'inline-block';
     switchTab('calendar');
+    renderCalendar();
     document.getElementById('successMsg').textContent = `✓ Loaded ${interviews.length} interview${interviews.length !== 1 ? 's' : ''}`;
     document.getElementById('successMsg').style.display = 'block';
 }
 
 function parseAngle(rows, angleNum) {
     if (!rows || rows.length === 0) return;
-
     rows.forEach(cols => {
         const get = i => (cols[i] || '').trim();
-
         const status = get(COLS.status);
         const name = get(COLS.name);
         const dateStr = get(COLS.date);
         const startTimeStr = get(COLS.startTime);
-
         if (!name) return;
-
         const validStatuses = ['Scheduled', 'Completed', 'In Process', 'Requested'];
         if (!validStatuses.includes(status)) return;
-
         const row = {
-            angle: angleNum,
-            status,
-            id: get(COLS.id),
-            profile: get(COLS.profile),
-            name,
-            company: get(COLS.company),
-            jobRole: get(COLS.jobRole),
-            location: get(COLS.location),
-            cost: get(COLS.cost),
-            network: get(COLS.network),
-            time: startTimeStr,
-            endTime: get(COLS.endTime),
-            netCost: get(COLS.netCost),
+            angle: angleNum, status,
+            id: get(COLS.id), profile: get(COLS.profile), name,
+            company: get(COLS.company), jobRole: get(COLS.jobRole),
+            location: get(COLS.location), cost: get(COLS.cost),
+            network: get(COLS.network), time: startTimeStr,
+            endTime: get(COLS.endTime), netCost: get(COLS.netCost),
             summary: get(COLS.summary)
         };
-
-        // Always include in allRows (for summary counts/costs)
         allRows.push(row);
-
-        // Only include in interviews (for calendar) if has valid date + time
         if (!dateStr || !startTimeStr) return;
         const dateObj = parseDate(dateStr);
         if (!dateObj) return;
-
         interviews.push({ ...row, date: dateObj.toISOString().split('T')[0] });
     });
 }
@@ -1165,18 +1266,11 @@ function parseAngle(rows, angleNum) {
 function parseDate(s) {
     s = s.trim();
     let m;
-    if ((m = s.match(/^(\d{2})\/(\d{2})\/(\d{2})$/))) {
-        return new Date(2000 + +m[3], +m[2] - 1, +m[1]);
-    }
-    if ((m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/))) {
-        return new Date(+m[3], +m[2] - 1, +m[1]);
-    }
-    if ((m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/))) {
-        return new Date(+m[1], +m[2] - 1, +m[3]);
-    }
+    if ((m = s.match(/^(\d{2})\/(\d{2})\/(\d{2})$/))) return new Date(2000 + +m[3], +m[2] - 1, +m[1]);
+    if ((m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/))) return new Date(+m[3], +m[2] - 1, +m[1]);
+    if ((m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/))) return new Date(+m[1], +m[2] - 1, +m[3]);
     return null;
 }
-
 
 function renderCalendar() {
     const wEnd = new Date(weekStart);
@@ -1184,9 +1278,7 @@ function renderCalendar() {
     document.getElementById('weekRange').textContent =
         `${weekStart.toLocaleDateString('en-GB', {day:'numeric', month:'short'})} – ${wEnd.toLocaleDateString('en-GB', {day:'numeric', month:'short', year:'numeric'})}`;
 
-    const activeStatuses = new Set(
-        [...document.querySelectorAll('.status-filter input:checked')].map(c => c.value)
-    );
+    const activeStatuses = new Set([...document.querySelectorAll('.status-filter input:checked')].map(c => c.value));
 
     const grid = document.getElementById('daysGrid');
     grid.innerHTML = '';
@@ -1203,19 +1295,17 @@ function renderCalendar() {
     });
 
     const today = new Date(); today.setHours(0,0,0,0);
+    const HOUR_PX = 56;
 
     for (let d = 0; d < 7; d++) {
         const date = new Date(weekStart);
         date.setDate(date.getDate() + d);
         const isToday = date.getTime() === today.getTime();
-
         const hdr = document.createElement('div');
         hdr.className = `day-header-cell${isToday ? ' today-col' : ''}`;
         hdr.innerHTML = `<span class="day-header-num">${date.getDate()}</span><span class="day-header-name">${date.toLocaleDateString('en-GB',{weekday:'short'})}</span>`;
         headerRow.appendChild(hdr);
     }
-
-    const HOUR_PX = 56;
 
     for (let d = 0; d < 7; d++) {
         const date = new Date(weekStart);
@@ -1227,25 +1317,16 @@ function renderCalendar() {
         col.className = `day-col${isToday ? ' today-col' : ''}`;
         col.style.cssText = `height:${HOURS.length * HOUR_PX}px; flex:1; position:relative;`;
 
-        HOURS.forEach(h => {
+        HOURS.forEach(() => {
             const cell = document.createElement('div');
             cell.className = `hour-cell${isToday ? ' today-col' : ''}`;
             col.appendChild(cell);
         });
 
-        const dayIvs = interviews.filter(iv =>
-            iv.date === dateStr && activeStatuses.has(iv.status)
-        );
-
-        // Convert times to minutes-since-midnight for overlap detection
+        const dayIvs = interviews.filter(iv => iv.date === dateStr && activeStatuses.has(iv.status));
         const toMins = t => { const [h,m] = t.split(':').map(Number); return h*60+m; };
-        const ivsWithTimes = dayIvs.map(iv => ({
-            ...iv,
-            startMin: toMins(iv.time),
-            endMin: toMins(iv.time) + 60
-        }));
+        const ivsWithTimes = dayIvs.map(iv => ({ ...iv, startMin: toMins(iv.time), endMin: toMins(iv.time) + 60 }));
 
-        // Group overlapping events: two events overlap if their [start,end) ranges intersect
         const assigned = new Array(ivsWithTimes.length).fill(false);
         const groups = [];
         ivsWithTimes.forEach((iv, i) => {
@@ -1254,15 +1335,14 @@ function renderCalendar() {
             assigned[i] = true;
             ivsWithTimes.forEach((iv2, j) => {
                 if (assigned[j]) return;
-                const overlapsAny = group.some(g => iv2.startMin < g.endMin && iv2.endMin > g.startMin);
-                if (overlapsAny) { group.push(iv2); assigned[j] = true; }
+                if (group.some(g => iv2.startMin < g.endMin && iv2.endMin > g.startMin)) {
+                    group.push(iv2); assigned[j] = true;
+                }
             });
             groups.push(group);
         });
 
-        // Render each group: each event in a group shares the column width equally
         groups.forEach(group => {
-            // Find the earliest start in the group to position the wrapper
             const minStart = Math.min(...group.map(iv => iv.startMin));
             const maxEnd = Math.max(...group.map(iv => iv.endMin));
             const topPx = (minStart - HOURS[0]*60) / 60 * HOUR_PX;
@@ -1273,10 +1353,9 @@ function renderCalendar() {
 
             group.forEach(iv => {
                 const ivTop = (iv.startMin - minStart) / 60 * HOUR_PX;
-                const ivHeight = HOUR_PX;
                 const card = document.createElement('div');
                 card.className = `interview-card angle-${iv.angle}`;
-                card.style.cssText = `flex:1; min-width:0; position:relative; top:${ivTop}px; height:${ivHeight}px; overflow:hidden; flex-shrink:0;`;
+                card.style.cssText = `flex:1; min-width:0; position:relative; top:${ivTop}px; height:${HOUR_PX}px; overflow:hidden; flex-shrink:0;`;
                 card.onclick = () => openModal(iv);
                 const netClass = ['Guidepoint','Synquery','Atheneum'].includes(iv.network) ? iv.network : 'unknown';
                 card.innerHTML = `
@@ -1296,10 +1375,8 @@ function renderCalendar() {
                     <div class="iv-name">${iv.name}</div>`;
                 wrapper.appendChild(card);
             });
-
             col.appendChild(wrapper);
         });
-
         grid.appendChild(col);
     }
 }
@@ -1337,6 +1414,7 @@ function clearAll() {
         zone.innerHTML = '';
     });
     interviews = [];
+    allRows = [];
     document.getElementById('calendarSection').style.display = 'none';
     switchTab('input');
     document.getElementById('saveBtn').style.display = 'none';
@@ -1344,77 +1422,30 @@ function clearAll() {
     document.getElementById('successMsg').style.display = 'none';
 }
 
-
 function savePage() {
-    // Serialize current data
     const data = JSON.stringify({ 1: rawData[1], 2: rawData[2], 3: rawData[3] });
-
-    // Get this page's source via fetch (works for local files and hosted files)
-    // The source is clean - rawData is replaced with actual values
-    const source = document.currentScript;
-
-    // Read the current page HTML as text, replace the empty rawData line
-    // We use XMLHttpRequest to get the actual file source (not DOM)
     const xhr = new XMLHttpRequest();
-    xhr.open('GET', window.location.href, false); // synchronous
-    try {
-        xhr.send();
-    } catch(e) {
-        // Local file fallback - reconstruct from known structure
-        doSave(getSourceFromDOM(), data);
-        return;
-    }
-    if (xhr.status === 200 || xhr.status === 0) {
-        doSave(xhr.responseText, data);
-    } else {
-        doSave(getSourceFromDOM(), data);
-    }
-}
-
-function getSourceFromDOM() {
-    // Reconstruct source from the actual script tag content
-    // This is reliable because we only have one script tag
-    const scripts = document.getElementsByTagName('script');
-    const styleTag = document.getElementsByTagName('style')[0];
-    const bodyHTML = document.body.innerHTML
-        .replace(/<div class="paste-zone[^"]*"[^>]*>.*?<\/div>/gs, m => {
-            const id = (m.match(/id="(zone\d)"/) || [])[1];
-            const angle = id ? id.replace('zone','') : '1';
-            const colors = {1:'#378ADD',2:'#BA7517',3:'#E24B4A'};
-            return '<div class="paste-zone angle-'+angle+' empty-hint" id="'+id+'" tabindex="0"></div>';
-        });
-    return '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+    xhr.open('GET', window.location.href, false);
+    try { xhr.send(); } catch(e) { doSave(document.documentElement.outerHTML, data); return; }
+    doSave(xhr.status === 200 || xhr.status === 0 ? xhr.responseText : document.documentElement.outerHTML, data);
 }
 
 function doSave(sourceHtml, dataJson) {
-    // Replace the empty rawData declaration with populated one
-    // Also inject auto-load call after rawData
     const marker = 'let rawData = { 1: [], 2: [], 3: [] };';
     const replacement = 'let rawData = ' + dataJson + ';'
         + '\nwindow.addEventListener(\'DOMContentLoaded\', function() {'
         + '\n  [1,2,3].forEach(function(a) {'
-        + '\n    if (rawData[a] && rawData[a].length) {'
-        + '\n      renderZonePreview(document.getElementById(\'zone\'+a), rawData[a], a);'
-        + '\n    }'
+        + '\n    if (rawData[a] && rawData[a].length) renderZonePreview(document.getElementById(\'zone\'+a), rawData[a], a);'
         + '\n  });'
         + '\n  loadCalendar();'
         + '\n});';
-
-    if (sourceHtml.indexOf(marker) === -1) {
-        alert('Could not find injection point in source. Try hosting the file on GitHub Pages first.');
-        return;
-    }
-
-    const saved = sourceHtml.replace(marker, replacement);
-    const blob = new Blob([saved], { type: 'text/html;charset=utf-8' });
+    if (sourceHtml.indexOf(marker) === -1) { alert('Could not find injection point. Try hosting on GitHub Pages first.'); return; }
+    const blob = new Blob([sourceHtml.replace(marker, replacement)], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url;
-    a.download = 'interview_calendar_saved.html';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(function() { URL.revokeObjectURL(url); }, 2000);
+    a.href = url; a.download = 'interview_calendar_saved.html';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
 window.addEventListener('click', e => { if (e.target === document.getElementById('modal')) closeModal(); });
@@ -1438,156 +1469,59 @@ function renderSummary() {
         el.innerHTML = '<p style="color:#999; font-size:13px;">Load calendar data to see summary.</p>';
         return;
     }
-
     const TARGETS = { 1: 25, 2: 15, 3: 10, total: 50 };
     const STATUSES = ['In Process', 'Scheduled', 'Completed'];
     const NETWORKS = ['Guidepoint', 'Atheneum', 'Synquery'];
 
-    // Count IVs per angle per status
     function countIvs(angle, status) {
-        return allRows.filter(iv =>
-            (angle === 'all' || iv.angle === angle) &&
-            (status === 'all' || iv.status === status)
-        ).length;
+        return allRows.filter(iv => (angle === 'all' || iv.angle === angle) && (status === 'all' || iv.status === status)).length;
     }
-
-    // Sum net cost per angle per status
     function sumCost(angle, status) {
-        return allRows
-            .filter(iv =>
-                (angle === 'all' || iv.angle === angle) &&
-                (status === 'all' || iv.status === status)
-            )
-            .reduce((acc, iv) => {
-                const v = parseFloat((iv.netCost || '0').toString().replace(/[^0-9.]/g,''));
-                return acc + (isNaN(v) ? 0 : v);
-            }, 0);
+        return allRows.filter(iv => (angle === 'all' || iv.angle === angle) && (status === 'all' || iv.status === status))
+            .reduce((acc, iv) => { const v = parseFloat((iv.netCost || '0').toString().replace(/[^0-9.]/g,'')); return acc + (isNaN(v) ? 0 : v); }, 0);
     }
-
-    // Sum net cost per network
     function sumCostByNetwork(network) {
-        return allRows
-            .filter(iv => iv.network === network)
-            .reduce((acc, iv) => {
-                const v = parseFloat((iv.netCost || '0').toString().replace(/[^0-9.]/g,''));
-                return acc + (isNaN(v) ? 0 : v);
-            }, 0);
+        return allRows.filter(iv => iv.network === network)
+            .reduce((acc, iv) => { const v = parseFloat((iv.netCost || '0').toString().replace(/[^0-9.]/g,'')); return acc + (isNaN(v) ? 0 : v); }, 0);
     }
 
-    // Build IV number tracker table
     let ivRows = '';
     [1,2,3].forEach(a => {
         const labelClass = a === 1 ? '' : a === 2 ? ' a2' : ' a3';
-        const cells = STATUSES.map(s => `<td>${fmt(countIvs(a, s))}</td>`).join('');
-        const total = countIvs(a, 'all');
-        ivRows += `<tr>
-            <td class="row-label${labelClass}">Angle ${a}</td>
-            ${cells}
-            <td>${fmt(total)}</td>
-        </tr>`;
+        ivRows += `<tr><td class="row-label${labelClass}">Angle ${a}</td>${STATUSES.map(s => `<td>${fmt(countIvs(a,s))}</td>`).join('')}<td>${fmt(countIvs(a,'all'))}</td></tr>`;
     });
-    const ivTotals = STATUSES.map(s => `<td>${fmt(countIvs('all', s))}</td>`).join('');
-    ivRows += `<tr class="total-row">
-        <td class="total-label">TOTAL:</td>
-        ${ivTotals}
-        <td>${fmt(countIvs('all','all'))}</td>
-    </tr>`;
+    ivRows += `<tr class="total-row"><td class="total-label">TOTAL:</td>${STATUSES.map(s => `<td>${fmt(countIvs('all',s))}</td>`).join('')}<td>${fmt(countIvs('all','all'))}</td></tr>`;
 
-    // Build target side table
-    let targetRows = '';
-    [1,2,3].forEach(a => {
-        targetRows += `<tr><td class="target-cell">${TARGETS[a]}</td></tr>`;
-    });
-    targetRows += `<tr><td style="font-weight:700;">${TARGETS.total}</td></tr>`;
+    let targetRows = [1,2,3].map(a => `<tr><td class="target-cell">${TARGETS[a]}</td></tr>`).join('') + `<tr><td style="font-weight:700;">${TARGETS.total}</td></tr>`;
 
-    // Build cost tracker table
     let costRows = '';
     [1,2,3].forEach(a => {
         const labelClass = a === 1 ? '' : a === 2 ? ' a2' : ' a3';
-        const cells = STATUSES.map(s => `<td>${fmtCost(sumCost(a, s))}</td>`).join('');
-        const total = sumCost(a, 'all');
-        costRows += `<tr>
-            <td class="row-label${labelClass}">Angle ${a}</td>
-            ${cells}
-            <td>${fmtCost(total)}</td>
-        </tr>`;
+        costRows += `<tr><td class="row-label${labelClass}">Angle ${a}</td>${STATUSES.map(s => `<td>${fmtCost(sumCost(a,s))}</td>`).join('')}<td>${fmtCost(sumCost(a,'all'))}</td></tr>`;
     });
-    const costTotals = STATUSES.map(s => `<td>${fmtCost(sumCost('all', s))}</td>`).join('');
-    costRows += `<tr class="total-row">
-        <td class="total-label">Total</td>
-        ${costTotals}
-        <td>${fmtCost(sumCost('all','all'))}</td>
-    </tr>`;
-
-    // Network cost side table
-    let networkCostRows = NETWORKS.map(n => `<td>${fmtCost(sumCostByNetwork(n))}</td>`).join('');
+    costRows += `<tr class="total-row"><td class="total-label">Total</td>${STATUSES.map(s => `<td>${fmtCost(sumCost('all',s))}</td>`).join('')}<td>${fmtCost(sumCost('all','all'))}</td></tr>`;
 
     el.innerHTML = `
         <div class="summary-block">
             <h3>IV number tracker</h3>
             <div class="summary-row-wrap">
-                <div>
-                    <table class="summary-table">
-                        <thead>
-                            <tr>
-                                <th class="row-header">Number of IVs</th>
-                                <th>In process</th>
-                                <th>Scheduled</th>
-                                <th>Completed</th>
-                                <th>Total</th>
-                            </tr>
-                        </thead>
-                        <tbody>${ivRows}</tbody>
-                    </table>
-                </div>
-                <div>
-                    <table class="summary-side-table">
-                        <thead><tr><th class="target-cell">Target</th></tr></thead>
-                        <tbody>${targetRows}</tbody>
-                    </table>
-                </div>
+                <div><table class="summary-table"><thead><tr><th class="row-header">Number of IVs</th><th>In process</th><th>Scheduled</th><th>Completed</th><th>Total</th></tr></thead><tbody>${ivRows}</tbody></table></div>
+                <div><table class="summary-side-table"><thead><tr><th class="target-cell">Target</th></tr></thead><tbody>${targetRows}</tbody></table></div>
             </div>
         </div>
-
         <div class="summary-block">
             <h3>IV cost tracker (USD)</h3>
             <div class="summary-row-wrap">
-                <div>
-                    <table class="summary-table">
-                        <thead>
-                            <tr>
-                                <th class="row-header">Cost of IVs USD</th>
-                                <th>In process</th>
-                                <th>Scheduled</th>
-                                <th>Completed</th>
-                                <th>Total (USD)</th>
-                            </tr>
-                        </thead>
-                        <tbody>${costRows}</tbody>
-                    </table>
-                </div>
-                <div>
-                    <table class="summary-side-table">
-                        <thead>
-                            <tr>
-                                <th>Guidepoint total</th>
-                                <th>Atheneum total</th>
-                                <th>Synquery total</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr>${networkCostRows}</tr>
-                        </tbody>
-                    </table>
-                </div>
+                <div><table class="summary-table"><thead><tr><th class="row-header">Cost of IVs USD</th><th>In process</th><th>Scheduled</th><th>Completed</th><th>Total (USD)</th></tr></thead><tbody>${costRows}</tbody></table></div>
+                <div><table class="summary-side-table"><thead><tr><th>Guidepoint total</th><th>Atheneum total</th><th>Synquery total</th></tr></thead><tbody><tr>${NETWORKS.map(n => `<td>${fmtCost(sumCostByNetwork(n))}</td>`).join('')}</tr></tbody></table></div>
             </div>
-        </div>
-    `;
+        </div>`;
 }
 
 setupZone('zone1', 1);
 setupZone('zone2', 2);
 setupZone('zone3', 3);
 </script>
+
 
 </body></html>
